@@ -9,6 +9,7 @@ Sublime text plugin that mimic the "live grep" feature of the [telescope](https:
 It will search in files, ignoring the glob pattern defined in those settings:
 - `binary_file_patterns`
 - `file_exclude_patterns`
+- `folder_exclude_patterns`
 
 It use the "smart case" option from rigprep (if everything is lower case, then the search is case insensitive).
 

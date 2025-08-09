@@ -79,9 +79,6 @@ class TelescopeCommand(sublime_plugin.TextCommand):
         skip_telescope_reset = True
         self.window.run_command("hide_panel")
 
-        init_views_scroll[self.window] = {}
-        del init_active_view[self.window]
-
 
 class TelescopeQueryCommand(sublime_plugin.TextCommand):
     """Executed on the output panel, execute the search."""
@@ -119,8 +116,10 @@ class TelescopeQueryCommand(sublime_plugin.TextCommand):
         folders = self.view.window().folders()
 
         # Exclude binary files and excluded pattern (by default, search in the sidebar tree)
-        exclude_patterns = self.view.settings().get("binary_file_patterns")
-        exclude_patterns += self.view.settings().get("file_exclude_patterns")
+        exclude_patterns = self.view.settings().get("binary_file_patterns") or []
+        exclude_patterns += self.view.settings().get("file_exclude_patterns") or []
+        exclude_patterns += [f"**/{f}**/" for f in self.view.settings().get("folder_exclude_patterns") or []]
+
         args.extend(("--glob", f"!{e}") for e in exclude_patterns)
 
         for s in search_terms:
@@ -342,6 +341,9 @@ def _reset_initial_state(window, close=True):
                 and view.sheet().is_semi_transient()
             ):
                 view.close()
+
+    init_views_scroll[window] = {}
+    del init_active_view[window]
 
 
 def _reset_initial_views_scroll(window):

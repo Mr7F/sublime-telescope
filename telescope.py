@@ -62,11 +62,9 @@ class TelescopeCommand(sublime_plugin.TextCommand):
 
     def on_enter(self, value):
         # We pressed enter, jump to the selected item
-        print("on_change")
         global current_selection, skip_telescope_reset
 
         vv = current_selection.pop(self.window, None)
-        print("vv", self.window)
         if not vv:
             self.window.run_command("hide_panel")
             return
@@ -129,7 +127,7 @@ class TelescopeQueryCommand(sublime_plugin.TextCommand):
             elif s == "~":
                 folders = [expanduser("~")]
             elif s.strip():
-                search.append(re.escape(s))
+                search.append(s)
 
         search = " ".join(search)
 

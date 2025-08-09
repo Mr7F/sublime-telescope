@@ -118,7 +118,10 @@ class TelescopeQueryCommand(sublime_plugin.TextCommand):
         # Exclude binary files and excluded pattern (by default, search in the sidebar tree)
         exclude_patterns = self.view.settings().get("binary_file_patterns") or []
         exclude_patterns += self.view.settings().get("file_exclude_patterns") or []
-        exclude_patterns += [f"**/{f}**/" for f in self.view.settings().get("folder_exclude_patterns") or []]
+        exclude_patterns += [
+            f"**/{f}**/"
+            for f in self.view.settings().get("folder_exclude_patterns") or []
+        ]
 
         args.extend(("--glob", f"!{e}") for e in exclude_patterns)
 
@@ -140,9 +143,10 @@ class TelescopeQueryCommand(sublime_plugin.TextCommand):
             args.append(("--files-with-matches", ""))
 
         # - max-count: maximum number of lines for each file (many match on the same column)
+        # - follow: follow symlink (like sublime text search)
         # - smart-case: case-insensitive if the search query is lower case
         cmd = (
-            "rg --json --smart-case --max-filesize=100M --max-count 100 --fixed-strings %(args)s %(search)s %(base_dir)s"
+            "rg --json --smart-case --max-filesize 100M --max-count 100 --follow --fixed-strings %(args)s %(search)s %(base_dir)s"
             % {
                 "search": shlex.quote(search) or "''",
                 "base_dir": " ".join(shlex.quote(d) for d in folders),
@@ -290,7 +294,7 @@ def _next_result(window, output_panel, direction, search_results, result_index):
             [regions[result_index]],
             icon="",
             scope="comment | region.yellowish",
-            flags=sublime.DRAW_EMPTY
+            flags=sublime.DRAW_EMPTY,
         )
         output_panel.show(regions[result_index])
 

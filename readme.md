@@ -1,5 +1,5 @@
 # Sublime - Telescope
-Sublime text plugin that mimic the "live grep" feature of the telescope plugin from VIM.
+Sublime text plugin that mimic the "live grep" feature of the [telescope](https://github.com/nvim-telescope/telescope.nvim) plugin from VIM.
 
 <p align="center">
   <img src="img/demo.gif">
@@ -17,6 +17,11 @@ In the query, term that starts with `*` or `-*` are considered as glob filter
 - `-*.py`: all files except python extension
 - `*/models/*`: direct files under `models` folder
 - `*/static/src/{js,css}/*`: any files under `/static/src/js` or `/static/src/css`
+- `~`: search in your home directory instead of the current project
+
+That plugin work with [ripgrep](https://github.com/BurntSushi/ripgrep)
+
+> sudo apt install ripgrep
 
 # Keybind
 ```json
@@ -40,3 +45,4 @@ In the query, term that starts with `*` or `-*` are considered as glob filter
 - ctrl+r to toggle regex
 - publish
 - Use quick panel once that issue is done: https://github.com/sublimehq/sublime_text/issues/4796
+- get the x first result with rg instead of head

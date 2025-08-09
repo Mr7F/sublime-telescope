@@ -18,7 +18,7 @@ search_queries = {}  # Used for debounce per output panel
 current_selection = {}  # {window: (result_index, Region, view, search_results)}
 
 # Save the view scroll to restore it when pressing escape
-init_views_scroll = {}  # {view: int}
+init_views_scroll = {}  # {window: {view: int}}
 init_active_view = {}  # {window: view}
 skip_telescope_reset = False
 
@@ -37,8 +37,9 @@ class TelescopeCommand(sublime_plugin.TextCommand):
     def run(self, edit):
         global init_active_view
         self.window = self.view.window()
+        init_views_scroll[self.window] = {}
         for view in self.view.window().views(include_transient=True):
-            init_views_scroll[view] = view.viewport_position()
+            init_views_scroll[self.window][view] = view.viewport_position()
         init_active_view[self.window] = self.window.active_view()
 
         self.out_view, self.in_view = self.window.create_io_panel(
@@ -77,6 +78,9 @@ class TelescopeCommand(sublime_plugin.TextCommand):
 
         skip_telescope_reset = True
         self.window.run_command("hide_panel")
+
+        init_views_scroll[self.window] = {}
+        del init_active_view[self.window]
 
 
 class TelescopeQueryCommand(sublime_plugin.TextCommand):
@@ -332,7 +336,7 @@ def _reset_initial_state(window, close=True):
     if close:
         for view in window.views(include_transient=True):
             if (
-                view not in init_views_scroll
+                view not in init_views_scroll[window]
                 and view.is_valid()
                 and view.sheet()
                 and view.sheet().is_semi_transient()
@@ -343,8 +347,8 @@ def _reset_initial_state(window, close=True):
 def _reset_initial_views_scroll(window):
     for view in window.views(include_transient=True):
         view.erase_regions("telescope-result-view")
-        if view in init_views_scroll:
-            view.set_viewport_position(init_views_scroll[view])
+        if view in init_views_scroll[window]:
+            view.set_viewport_position(init_views_scroll[window][view])
 
 
 def _set_file_view_regions(

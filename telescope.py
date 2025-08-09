@@ -73,12 +73,12 @@ class TelescopeCommand(sublime_plugin.TextCommand):
 
         index, region, view, _search_results = vv
         _reset_initial_state(self.window, close=False)
-        self.view.window().focus_view(view)
+        self.window.focus_view(view)
         view.sel().clear()
         view.sel().add(region)
 
         skip_telescope_reset = True
-        self.view.window().run_command("hide_panel")
+        self.window.run_command("hide_panel")
 
 
 class TelescopeQueryCommand(sublime_plugin.TextCommand):

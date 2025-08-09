@@ -53,11 +53,12 @@ class TelescopeCommand(sublime_plugin.TextCommand):
 
         if len(self.view.sel()):
             text = self.view.substr(self.view.sel()[-1])
+        if not text or "\n" in text:
+            text = self.in_view.substr(sublime.Region(0, self.in_view.size()))
+
         if text and "\n" not in text:
             self.in_view.run_command("telescope_set_initial_search", {"search": text})
             self.out_view.run_command("telescope_query", {"search_query": text})
-        else:
-            self.in_view.run_command("telescope_clear")
 
         self.window.run_command("show_panel", {"panel": "output.telescope"})
 
@@ -74,7 +75,7 @@ class TelescopeCommand(sublime_plugin.TextCommand):
         _reset_initial_state(self.window, close=False)
         self.window.focus_view(view)
         view.sel().clear()
-        view.sel().add(region)
+        view.sel().add(sublime.Region(region.a, region.a))
 
         skip_telescope_reset = True
         self.window.run_command("hide_panel")
@@ -301,6 +302,9 @@ def _next_result(window, output_panel, direction, search_results, result_index):
 
 class IoPanelEventListener(sublime_plugin.EventListener):
     def on_modified(self, view: sublime.View):
+        # print(view, view.name(), view.substr(sublime.Region(0, view.size())))
+        # print(view.settings().get("is_input_widget"))
+
         # TODO: better way to catch "on_input" on the input panel?
         if not view.settings().get("is_input_widget") or not view.window():
             return

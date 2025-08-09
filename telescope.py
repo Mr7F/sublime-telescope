@@ -6,7 +6,7 @@ import sublime_plugin
 import shlex
 import os
 from os.path import expanduser
-
+from sys import platform
 
 # perform less than 1 update each "x" ms
 # to avoid making the UI lagging
@@ -131,8 +131,15 @@ class TelescopeQueryCommand(sublime_plugin.TextCommand):
 
         search = " ".join(search)
 
+        only_files = False
+        if not search:
+            only_files = True
+            args.append(("--files-with-matches", ""))
+
+        # - max-count: maximum number of lines for each file (many match on the same column)
+        # - smart-case: case-insensitive if the search query is lower case
         cmd = (
-            "timeout 1s rg --json --smart-case --fixed-strings %(args)s %(search)s %(base_dir)s"
+            "rg --json --smart-case --max-filesize=100M --max-count 100 --fixed-strings %(args)s %(search)s %(base_dir)s"
             % {
                 "search": shlex.quote(search) or "''",
                 "base_dir": " ".join(shlex.quote(d) for d in folders),
@@ -141,20 +148,23 @@ class TelescopeQueryCommand(sublime_plugin.TextCommand):
                 ),
             }
         )
-        cmd += "| head -n200"  # TODO: should work on windows
+
+        if "linux" in platform or "darwin" in platform:
+            # TODO: should work on windows
+            cmd = "timeout 1s " + cmd + " | head -n200"
 
         print(cmd)
 
         self.view.run_command(
             "telescope_set_result",
-            {"result": list(os.popen(cmd).readlines())},
+            {"result": list(os.popen(cmd).readlines()), "only_files": only_files},
         )
 
 
 class TelescopeSetResultCommand(sublime_plugin.TextCommand):
     """Executed on the output panel, set the result in the view."""
 
-    def run(self, edit, result):
+    def run(self, edit, result, only_files=False):
         self.view.erase(edit, sublime.Region(0, self.view.size()))
         self.view.assign_syntax("Packages/Default/Find Results.hidden-tmLanguage")
         self.view.settings().set("result_file_regex", r"^([^ \t].*):$")
@@ -168,32 +178,39 @@ class TelescopeSetResultCommand(sublime_plugin.TextCommand):
             if not line.strip():
                 continue
 
-            line = json.loads(line)
-            if line.get("type") == "begin":
-                path = line.get("data", {}).get("path", {}).get("text") or ""
-                if to_show:
-                    to_show += "\n\n"
-                to_show += path + ":"
+            if only_files:
+                # We didn't search anything except the path
+                path = line[:-1]
+                offset = ii_view + len(to_show)
+                search_results.append(SearchResult(path, 0, (0, 0), (offset, offset)))
+                to_show += path + "\n"
+            else:
+                line = json.loads(line)
+                if line.get("type") == "begin":
+                    path = line.get("data", {}).get("path", {}).get("text") or ""
+                    if to_show:
+                        to_show += "\n\n"
+                    to_show += path + ":"
 
-            if line.get("type") == "match":
-                data = line.get("data", {})
-                content = data.get("lines", {}).get("text").replace("\n", " ")
-                path = line.get("data", {}).get("path", {}).get("text") or ""
-                line_number = data.get("line_number", 0)
-                to_show += "\n" + str(line_number) + ": "
-                to_trim = next((i for i, s in enumerate(content) if s.strip()), 0)
-                offset = ii_view + len(to_show) - to_trim
+                if line.get("type") == "match":
+                    data = line.get("data", {})
+                    content = data.get("lines", {}).get("text").replace("\n", " ")
+                    path = line.get("data", {}).get("path", {}).get("text") or ""
+                    line_number = data.get("line_number", 0)
+                    to_show += "\n" + str(line_number) + ": "
+                    to_trim = next((i for i, s in enumerate(content) if s.strip()), 0)
+                    offset = ii_view + len(to_show) - to_trim
 
-                search_results.extend(
-                    SearchResult(
-                        path,
-                        line_number,
-                        (m["start"], m["end"]),
-                        (m["start"] + offset, m["end"] + offset),
+                    search_results.extend(
+                        SearchResult(
+                            path,
+                            line_number,
+                            (m["start"], m["end"]),
+                            (m["start"] + offset, m["end"] + offset),
+                        )
+                        for m in data.get("submatches", ())
                     )
-                    for m in data.get("submatches", ())
-                )
-                to_show += content[to_trim:]
+                    to_show += content[to_trim:][:500]
 
             if i % 100 == 0:
                 self.view.insert(edit, self.view.size(), to_show)

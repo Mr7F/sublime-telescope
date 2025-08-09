@@ -23,6 +23,8 @@ That plugin work with [ripgrep](https://github.com/BurntSushi/ripgrep)
 
 > sudo apt install ripgrep
 
+> brew install coreutils ripgrep
+
 # Keybind
 ```json
 {

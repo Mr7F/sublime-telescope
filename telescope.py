@@ -200,7 +200,7 @@ class TelescopeSetResultCommand(sublime_plugin.TextCommand):
                     content = data.get("lines", {}).get("text").replace("\n", " ")
                     path = line.get("data", {}).get("path", {}).get("text") or ""
                     line_number = data.get("line_number", 0)
-                    to_show += "\n" + str(line_number) + ": "
+                    to_show += "\n " + str(line_number) + ": "
                     to_trim = next((i for i, s in enumerate(content) if s.strip()), 0)
                     offset = ii_view + len(to_show) - to_trim
 

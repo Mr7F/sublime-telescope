@@ -184,9 +184,9 @@ class TelescopeSetResultCommand(sublime_plugin.TextCommand):
             if only_files:
                 # We didn't search anything except the path
                 path = line[:-1]
-                offset = ii_view + len(to_show)
-                search_results.append(SearchResult(path, 0, (0, 0), (offset, offset)))
                 to_show += path + "\n"
+                offset = ii_view + len(to_show) - 1
+                search_results.append(SearchResult(path, 0, (0, 0), (offset, offset)))
             else:
                 line = json.loads(line)
                 if line.get("type") == "begin":
@@ -290,6 +290,7 @@ def _next_result(window, output_panel, direction, search_results, result_index):
             [regions[result_index]],
             icon="",
             scope="comment | region.yellowish",
+            flags=sublime.DRAW_EMPTY
         )
         output_panel.show(regions[result_index])
 

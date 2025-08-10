@@ -29,18 +29,14 @@ That plugin work with [ripgrep](https://github.com/BurntSushi/ripgrep)
 # Keybind
 ```json
 {
-    "keys": ["ctrl+i"],
-    "command": "telescope",
-},
-{
     "keys": ["ctrl+."],
     "command": "telescope_find_next",
-    "context": [{"key": "panel", "operand": "output.telescope"}, {"key": "panel_has_focus"}],
+    "context": [{"key": "panel", "operand": "find_in_files"}, {"key": "panel_has_focus"}],
 },
 {
     "keys": ["ctrl+,"],
     "command": "telescope_find_prev",
-    "context": [{"key": "panel", "operand": "output.telescope"}, {"key": "panel_has_focus"}],
+    "context": [{"key": "panel", "operand": "find_in_files"}, {"key": "panel_has_focus"}],
 }
 ```
 

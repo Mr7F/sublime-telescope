@@ -3,26 +3,23 @@ import sublime
 import sublime_plugin
 import shlex
 import os
-from sys import platform
-import time
 
-# perform less than 1 update each "x" ms, waiting for https://github.com/sublimehq/sublime_text/issues/4796
-DEBOUNCE_MS = 500
+
+# LSP "Go to symbols" has a similar feature
+# Hope this issue is fixed one day...
+# > https://github.com/sublimehq/sublime_text/issues/4796
+from .utils import DynamicListInputHandler, PreselectedListInputHandler
+
 
 regions_to_add = {}
-
 init_active_view = {}  # {window: view}
-
+init_view_sel = {}  # {window: {view: sel}}
 preview_panels = {}
 
-current_text = ""
-current_sel = [(0, 0)]
 current_extension = ""
 current_highlight_index = -1
 
 search_results = ()
-is_telescope_open = False
-skip_next_auto_select = False
 
 
 @dataclass
@@ -49,112 +46,104 @@ class TelescopeCommand(sublime_plugin.WindowCommand):
         self.window.open_file(s.path, flags=sublime.SEMI_TRANSIENT)
 
     def input(self, args):
-        print("input", args)
-        _save_initial_state(self.window)
-
-        if "extension" not in args:
-            print("here")
-            return ExtensionInputHandler("extension", self.window)
-
-        if "result" not in args:
-            return TelescopeListInputHandler("result", self.window)
+        # Always set the input to see the breadcrumb item
+        # when reloading the command input with the hack in `utils.py`
+        if not args:
+            _save_initial_state(self.window)
+        return ExtensionInputHandler(self)
 
 
-class ExtensionInputHandler(sublime_plugin.TextInputHandler):
-    def __init__(self, name, window):
-        global current_extension, skip_next_auto_select
-        self._name = name
-        self.window = window
+class ExtensionInputHandler(PreselectedListInputHandler):
+    def __init__(self, window_command):
+        self.window_command = window_command
 
-        if current_extension:
-            # An other hack because we miss feature in the API...
-            # Auto-select the item, but it needs to not auto-select
-            # the ListInput
-            skip_next_auto_select = time.time() + 0.5
-            sublime.set_timeout(lambda: self.window.run_command("select"))
+        self.extensions, default = _get_valid_file_extensions(
+            self.window_command.window
+        )
+        super().__init__(window_command.window, current_extension or default)
+
+    def get_list_items(self):
+        return self.extensions
 
     def name(self):
-        return self._name
+        return "extension"
 
     def placeholder(self):
         return "File Extension"
 
-    def initial_text(self):
-        return current_extension
-
     def next_input(self, args):
         global current_extension
-        current_extension = args[self._name]
+        current_extension = args[self.name()]
         if "result" not in args:
-            return TelescopeListInputHandler("result", self.window)
+            return TelescopeListInputHandler(self.window_command, args)
 
 
-class TelescopeListInputHandler(sublime_plugin.ListInputHandler):
-    def __init__(self, name, window):
-        global is_telescope_open, search_results
-        is_telescope_open = True
-        self._name = name
-        self.window = window
+class TelescopeListInputHandler(DynamicListInputHandler):
+    def __init__(self, window_command, args):
+        super().__init__(window_command, args)
+        self.window_command = window_command
 
     def name(self):
-        return self._name
-
-    def initial_text(self):
-        global current_text
-        print("initial query", current_text, len(current_text))
-        return current_text
-
-    def want_event(self):
-        return True
-
-    def initial_selection(self):
-        print("initial_selection", current_sel)
-        return current_sel
+        return "result"
 
     def placeholder(self):
         return "Fuzzy find"
 
     def cancel(self):
-        global search_results, is_telescope_open, current_text
-
-        is_telescope_open = False
-        for view in self.window.views(include_transient=True):
+        for view in self.window_command.window.views(include_transient=True):
             view.erase_regions("telescope-result-view")
 
-        _search_queries.pop(self.window, None)  # Cancel all debounce
-        _reset_initial_state(self.window)
+        _reset_initial_state(self.window_command.window)
 
-    def validate(self, text, event):
-        global search_results, is_telescope_open, current_text, skip_next_auto_select
+    def validate(self, text):
+        global search_results
 
-        if skip_next_auto_select and skip_next_auto_select >= time.time():
-            return False
-
-        print("validate", text, event)
         if not (text or "").strip():
             return False
 
-        is_telescope_open = False
         return True
 
+    def initial_selection(self):
+        if hasattr(self.command, "_selection"):
+            return self.command._selection
+        return super().initial_selection()
+
     def preview(self, text):
+        """Save the current highlighted index and show the preview.
+
+        Save the highlighted element, so we can re-open the view
+        at the same position.
+        """
         global current_highlight_index
         if (text or "").strip():
             current_highlight_index = int(text.split(":", 1)[0])
-            print("current_highlight_index", current_highlight_index)
-            _next_result(self.window, search_results, current_highlight_index)
+            _preview_result(
+                self.window_command.window,
+                search_results,
+                current_highlight_index,
+            )
 
-    def list_items(self):
-        first_el = sublime.ListInputItem(
-            text=_fixed_size("", 100),
-            details=_fixed_size("", 100),
-            value=None,
+    def on_modified(self, text: str) -> None:
+        global search_results
+        search_results = _live_search(
+            self.window_command.window,
+            text,
+            self.args["extension"],
         )
-        print("list_items")
-        if not search_results:
-            return [first_el]
 
-        print("current_highlight_index", current_highlight_index)
+        setattr(
+            self.command,
+            "_selection",
+            [s.to_tuple() for s in self.input_view.sel()],
+        )
+        self.update(self._list_items(search_results))
+
+    def get_list_items(self):
+        return self._list_items(search_results)
+
+    def _list_items(self, search_results):
+        if not search_results:
+            return []
 
         return [
             sublime.ListInputItem(
@@ -171,24 +160,6 @@ class TelescopeListInputHandler(sublime_plugin.ListInputHandler):
 
 
 class IoPanelEventListener(sublime_plugin.EventListener):
-    def on_modified(self, view: sublime.View):
-        global current_text, is_telescope_open, current_sel
-        # print("on_modified_async", view.substr(sublime.Region(0, view.size())))
-        # print(view.element(), is_telescope_open)
-
-        # TODO: is there a better way to detect that it's the telescope quick panel?
-        if view.element() == "command_palette:input" and is_telescope_open:
-            query = view.substr(sublime.Region(0, view.size()))
-            # print("here", view.element(), view.name(), query)
-            window = view.window()
-            if query == current_text:
-                return
-
-            current_text = query
-            current_sel = [s.to_tuple() for s in view.sel()]
-
-            _debounced_live_search(window, query, current_extension)
-
     def on_load(self, view):
         window = view.window()
         if window in regions_to_add and view == regions_to_add[window][0]:
@@ -199,12 +170,14 @@ class IoPanelEventListener(sublime_plugin.EventListener):
 def _save_initial_state(window):
     global init_active_view
     init_active_view[window] = window.active_view()
-    print("_save_initial_state", init_active_view)
+
+    init_view_sel[window] = {}
+    for view in window.views():
+        init_view_sel[window][view] = list(view.sel())
 
 
 def _reset_initial_state(window, focus_old_view=True, close_preview=False):
     global init_active_view, preview_panels
-    print("_reset_initial_state", init_active_view)
     if window in init_active_view and focus_old_view:
         window.focus_view(init_active_view[window])
 
@@ -213,45 +186,16 @@ def _reset_initial_state(window, focus_old_view=True, close_preview=False):
         if preview_panel and preview_panel.sheet().is_semi_transient():
             preview_panel.close()
 
-    # del init_active_view[window]
-
-
-_search_queries = {}
-_last_calls = {}
-
-
-def _debounced_live_search(window, search_query, extension):
-    print("_debounced_live_search")
-
-    last_call = _last_calls.get(window, -float("inf"))
-    _search_queries[window] = (search_query, extension)
-    delay_ms = min(DEBOUNCE_MS, max(0, DEBOUNCE_MS - (last_call - time.time() * 1000)))
-    print("delay_ms", delay_ms)
-    sublime.set_timeout_async(lambda w=window: _call_live_search(w), delay_ms)
-
-
-def _call_live_search(window):
-    global _last_calls
-    if window not in _search_queries:
-        return
-
-    last_call = _last_calls.get(window, -float("inf"))
-    query, extension = _search_queries[window]
-    if (time.time() - last_call) * 1000 < DEBOUNCE_MS:
-        return
-
-    _last_calls[window] = float("inf")
-    _search_queries[window] = (query, extension)
-    _live_search(window, query, extension)
-    _last_calls[window] = time.time()
+    if window in init_view_sel:
+        for view, sel in init_view_sel[window].items():
+            view.sel().clear()
+            view.sel().add_all(sel)
 
 
 def _live_search(window, search_query, extension):
-    global preview_panels, search_results, current_sel, current_text
+    global preview_panels, search_results
     if len(search_query) < 3:
         return
-
-    folders = window.folders()
 
     # Heuristic to filter result with ripgrep first
     rg_search = []
@@ -271,24 +215,19 @@ def _live_search(window, search_query, extension):
         """.strip().replace("\n", " ")
         % {
             "extension": shlex.quote(extension),
-            "base_dir": " ".join(shlex.quote(d) for d in folders),
+            "base_dir": " ".join(shlex.quote(d) for d in window.folders()),
             "rg_search": " ".join(f"-e {shlex.quote(p)}" for p in rg_search),
             "search_query": shlex.quote(search_query),
         }
     )
 
-    # print(cmd)
-    print("run", search_query)
-
     search_results = []
-
     for i, line in enumerate(os.popen(cmd).readlines()):
         if not line.strip():
             continue
         path, line_number, content = line.split(":", 2)
         to_trim = next((i for i, s in enumerate(content) if s.strip()), 0)
         content = content.strip()
-        # print(path, line_number, content)
 
         search_results.append(
             SearchResult(
@@ -299,14 +238,10 @@ def _live_search(window, search_query, extension):
             )
         )
 
-    if command_panel := _get_command_panel(window):
-        current_text = command_panel.substr(sublime.Region(0, command_panel.size()))
-        current_sel = [s.to_tuple() for s in command_panel.sel()]
-    window.run_command("hide_overlay")
-    window.run_command("telescope")
+    return search_results
 
 
-def _next_result(window, search_results, result_index):
+def _preview_result(window, search_results, result_index):
     if not search_results:
         return
 
@@ -355,21 +290,55 @@ def _set_file_view_regions(
     )
 
 
-def _get_command_panel(window):
-    # TODO: is there a better way?
-    # Because of the debounced, the view can be destroyed if we are late
-    for n in range(1000):
-        view = sublime.View(n)
-        if view.element() != "command_palette:input":
-            continue
-        if view.window() != window:
-            continue
-        return view
-
-
 def _fixed_size(s, size):
     """Make the string having a fixed size."""
     s = s or ""
     s = s[:size]
     s += " " * (size - len(s))
     return s
+
+
+_extension_cache = {}
+
+
+def _get_valid_file_extensions(window):
+    if window not in _extension_cache:
+        _get_valid_file_extensions_update_cache(window)
+    else:
+        sublime.set_timeout_async(
+            lambda: _get_valid_file_extensions_update_cache(window)
+        )
+
+    return _extension_cache[window]
+
+
+def _get_valid_file_extensions_update_cache(window):
+    # Execute the first time, the second time returns the cached value
+    # and update the cache in background
+    view = window.active_view()
+    exclude_patterns = view.settings().get("binary_file_patterns") or []
+    exclude_patterns += view.settings().get("file_exclude_patterns") or []
+    exclude_patterns += [
+        f"**/{f}**/" for f in view.settings().get("folder_exclude_patterns") or []
+    ]
+
+    glob = " ".join(f"--iglob {shlex.quote('!' + e)}" for e in exclude_patterns)
+    cmd = (
+        """
+        rg  --no-heading --follow --max-filesize 100M --files-with-matches --fixed-strings %(glob)s --glob= '' %(base_dir)s | sed -n 's/.*\(\.[^/]*\)$/\\1/p' | sort -u
+        """.strip().replace("\n", " ")
+        % {
+            "base_dir": " ".join(shlex.quote(d) for d in window.folders()),
+            "glob": glob,
+        }
+    )
+
+    extensions = [e.strip()[1:] for e in os.popen(cmd).readlines()]
+
+    default = None
+    if file_name := view.file_name():
+        default = file_name.rsplit(".", 1)[-1]
+        if default not in extensions:
+            extensions.append(default)
+
+    _extension_cache[window] = extensions, default

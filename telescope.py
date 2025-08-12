@@ -3,6 +3,7 @@ import sublime
 import sublime_plugin
 import shlex
 import os
+import time
 
 
 # LSP "Go to symbols" has a similar feature
@@ -298,13 +299,24 @@ def _fixed_size(s, size):
     return s
 
 
-_extension_cache = {}
+_extension_cache = {}  # {window: [extension]}
+_last_extension_update = {}  # {window: last_update_time}
+_max_extension_update_seconds = 5
 
 
 def _get_valid_file_extensions(window):
+    # Execute the first time, the second time returns the cached value
+    # and update the cache in background
+    global _last_extension_update, _extension_cache
     if window not in _extension_cache:
+        _last_extension_update[window] = time.time()
         _get_valid_file_extensions_update_cache(window)
-    else:
+
+    elif (
+        window not in _last_extension_update
+        or _last_extension_update[window] + _max_extension_update_seconds < time.time()
+    ):
+        _last_extension_update[window] = time.time()  # Needs to be sync
         sublime.set_timeout_async(
             lambda: _get_valid_file_extensions_update_cache(window)
         )
@@ -313,8 +325,9 @@ def _get_valid_file_extensions(window):
 
 
 def _get_valid_file_extensions_update_cache(window):
-    # Execute the first time, the second time returns the cached value
-    # and update the cache in background
+    global _last_extension_update, _extension_cache
+    print("Update extensions cache")
+
     view = window.active_view()
     exclude_patterns = view.settings().get("binary_file_patterns") or []
     exclude_patterns += view.settings().get("file_exclude_patterns") or []

@@ -338,7 +338,7 @@ def _get_valid_file_extensions_update_cache(window):
     glob = " ".join(f"--iglob {shlex.quote('!' + e)}" for e in exclude_patterns)
     cmd = (
         """
-        rg  --no-heading --follow --max-filesize 100M --files-with-matches --fixed-strings %(glob)s --glob= '' %(base_dir)s | sed -n 's/.*\(\.[^/]*\)$/\\1/p' | sort -u
+        rg  --no-heading --follow --max-filesize 100M --files --fixed-strings %(glob)s %(base_dir)s | sed -n 's/.*\(\.[^/]*\)$/\\1/p' | sort -u
         """.strip().replace("\n", " ")
         % {
             "base_dir": " ".join(shlex.quote(d) for d in window.folders()),

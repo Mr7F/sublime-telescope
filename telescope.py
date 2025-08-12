@@ -1,5 +1,3 @@
-import re
-import json
 from dataclasses import dataclass
 import sublime
 import sublime_plugin
@@ -9,7 +7,7 @@ from sys import platform
 import time
 
 # perform less than 1 update each "x" ms, waiting for https://github.com/sublimehq/sublime_text/issues/4796
-DEBOUNCE_MS = 1000
+DEBOUNCE_MS = 500
 
 regions_to_add = {}
 
@@ -18,9 +16,13 @@ init_active_view = {}  # {window: view}
 preview_panels = {}
 
 current_text = ""
+current_sel = [(0, 0)]
+current_extension = ""
+current_highlight_index = -1
 
 search_results = ()
 is_telescope_open = False
+skip_next_auto_select = False
 
 
 @dataclass
@@ -33,85 +35,159 @@ class SearchResult:
     line_content: str
 
 
-def _fixed_size(s, size):
-    """Make the string having a fixed size."""
-    s = s or ""
-    s = s[:size]
-    s += " " * (size - len(s))
-    return s
-
-
 class TelescopeCommand(sublime_plugin.WindowCommand):
     """Executed on the output panel, set the result in the view."""
 
-    def run(self, text=None):
-        global current_text, search_results, is_telescope_open
-        if text is None:
-            # Initial call
-            _save_initial_state(self.window)
-            print("search result", len(search_results))
+    def run(self, extension, result):
+        global search_results
+        print("run command", extension, result)
 
-        if search_results:
-            result = [
-                sublime.QuickPanelItem(
-                    trigger=_fixed_size(s.line_content.strip(), 200),
-                    details=f"{s.path}:{s.line_number}:{s.line_position[0]}",
-                )
-                for s in search_results
-            ]
-            _next_result(self.window, 0, search_results)
-        else:
-            result = [[_fixed_size(" ", 200), _fixed_size(" ", 200)]]
+        for view in self.window.views(include_transient=True):
+            view.erase_regions("telescope-result-view")
+        s = search_results[int(result.split(":", 1)[0])]
+        # TODO: keep transient view if possible
+        self.window.open_file(s.path, flags=sublime.SEMI_TRANSIENT)
 
-        current_text = text
-        self.window.show_quick_panel(
-            result,
-            on_select=self.on_select,
-            on_highlight=self.on_highlight,
-        )
+    def input(self, args):
+        print("input", args)
+        _save_initial_state(self.window)
+
+        if "extension" not in args:
+            print("here")
+            return ExtensionInputHandler("extension", self.window)
+
+        if "result" not in args:
+            return TelescopeListInputHandler("result", self.window)
+
+
+class ExtensionInputHandler(sublime_plugin.TextInputHandler):
+    def __init__(self, name, window):
+        global current_extension, skip_next_auto_select
+        self._name = name
+        self.window = window
+
+        if current_extension:
+            # An other hack because we miss feature in the API...
+            # Auto-select the item, but it needs to not auto-select
+            # the ListInput
+            skip_next_auto_select = time.time() + 0.5
+            sublime.set_timeout(lambda: self.window.run_command("select"))
+
+    def name(self):
+        return self._name
+
+    def placeholder(self):
+        return "File Extension"
+
+    def initial_text(self):
+        return current_extension
+
+    def next_input(self, args):
+        global current_extension
+        current_extension = args[self._name]
+        if "result" not in args:
+            return TelescopeListInputHandler("result", self.window)
+
+
+class TelescopeListInputHandler(sublime_plugin.ListInputHandler):
+    def __init__(self, name, window):
+        global is_telescope_open, search_results
         is_telescope_open = True
-        if text:
-            # TODO: keep selection
-            self.window.run_command("append", {"characters": text})
-            self.window.run_command("move_to", {"to": "eol"})
+        self._name = name
+        self.window = window
 
-    def on_select(self, idx):
-        global search_results, is_telescope_open
+    def name(self):
+        return self._name
+
+    def initial_text(self):
+        global current_text
+        print("initial query", current_text, len(current_text))
+        return current_text
+
+    def want_event(self):
+        return True
+
+    def initial_selection(self):
+        print("initial_selection", current_sel)
+        return current_sel
+
+    def placeholder(self):
+        return "Fuzzy find"
+
+    def cancel(self):
+        global search_results, is_telescope_open, current_text
+
         is_telescope_open = False
-
         for view in self.window.views(include_transient=True):
             view.erase_regions("telescope-result-view")
 
         _search_queries.pop(self.window, None)  # Cancel all debounce
+        _reset_initial_state(self.window)
 
-        if idx >= 0:  # TODO: on_cancel
-            print("on_select", idx)
-            s = search_results[idx]
-            # TODO: keep transient view if possible
-            view = self.window.open_file(s.path, flags=sublime.SEMI_TRANSIENT)
-            view = preview_panels[self.window]
-        else:
-            _reset_initial_state(self.window)
+    def validate(self, text, event):
+        global search_results, is_telescope_open, current_text, skip_next_auto_select
 
-    def on_highlight(self, idx):
-        _next_result(self.window, search_results, idx)
+        if skip_next_auto_select and skip_next_auto_select >= time.time():
+            return False
+
+        print("validate", text, event)
+        if not (text or "").strip():
+            return False
+
+        is_telescope_open = False
+        return True
+
+    def preview(self, text):
+        global current_highlight_index
+        if (text or "").strip():
+            current_highlight_index = int(text.split(":", 1)[0])
+            print("current_highlight_index", current_highlight_index)
+            _next_result(self.window, search_results, current_highlight_index)
+
+    def list_items(self):
+        first_el = sublime.ListInputItem(
+            text=_fixed_size("", 100),
+            details=_fixed_size("", 100),
+            value=None,
+        )
+        print("list_items")
+        if not search_results:
+            return [first_el]
+
+        print("current_highlight_index", current_highlight_index)
+
+        return [
+            sublime.ListInputItem(
+                text=_fixed_size(s.line_content.strip(), 100),
+                details=_fixed_size(
+                    f"{s.path}:{s.line_number}:{s.line_position[0]}", 100
+                ),
+                # TODO: remove that hack (otherwise it's closed)
+                value=str(i) + ":" + s.line_content.strip(),
+                annotation="",
+            )
+            for i, s in enumerate(search_results)
+        ], current_highlight_index
 
 
 class IoPanelEventListener(sublime_plugin.EventListener):
-    def on_modified_async(self, view: sublime.View):
-        global current_text, is_telescope_open
+    def on_modified(self, view: sublime.View):
+        global current_text, is_telescope_open, current_sel
+        # print("on_modified_async", view.substr(sublime.Region(0, view.size())))
+        # print(view.element(), is_telescope_open)
+
         # TODO: is there a better way to detect that it's the telescope quick panel?
-        if view.element() == "quick_panel:input" and is_telescope_open:
-            print(view.element(), view.name())
-            window = view.window()
+        if view.element() == "command_palette:input" and is_telescope_open:
             query = view.substr(sublime.Region(0, view.size()))
+            # print("here", view.element(), view.name(), query)
+            window = view.window()
             if query == current_text:
                 return
 
-            _debounced_live_search(window, query)
+            current_text = query
+            current_sel = [s.to_tuple() for s in view.sel()]
 
-    def on_window_command(self, window, command_name, args):
-        print("command_name", command_name, args, command_name == "find_all")
+            _debounced_live_search(window, query, current_extension)
 
     def on_load(self, view):
         window = view.window()
@@ -141,37 +217,38 @@ def _reset_initial_state(window, focus_old_view=True, close_preview=False):
 
 
 _search_queries = {}
+_last_calls = {}
 
 
-def _debounced_live_search(window, search_query):
-    now = time.time()
+def _debounced_live_search(window, search_query, extension):
+    print("_debounced_live_search")
 
-    if window not in _search_queries:
-        _search_queries[window] = (now, search_query)
-        _call_live_search(window)
-    else:
-        last_call, _ = _search_queries[window]
-        _search_queries[window] = (last_call, search_query)
-
-        delay_ms = max(0, DEBOUNCE_MS - int((now - last_call) * 1000))
-        sublime.set_timeout_async(lambda w=window: _call_live_search(w), delay_ms)
+    last_call = _last_calls.get(window, -float("inf"))
+    _search_queries[window] = (search_query, extension)
+    delay_ms = min(DEBOUNCE_MS, max(0, DEBOUNCE_MS - (last_call - time.time() * 1000)))
+    print("delay_ms", delay_ms)
+    sublime.set_timeout_async(lambda w=window: _call_live_search(w), delay_ms)
 
 
 def _call_live_search(window):
+    global _last_calls
     if window not in _search_queries:
         return
 
-    last_call, query = _search_queries[window]
-    if int((time.time() - last_call) * 1000) < DEBOUNCE_MS:
+    last_call = _last_calls.get(window, -float("inf"))
+    query, extension = _search_queries[window]
+    if (time.time() - last_call) * 1000 < DEBOUNCE_MS:
         return
 
-    _search_queries[window] = (time.time(), query)
-    _live_search(window, query)
+    _last_calls[window] = float("inf")
+    _search_queries[window] = (query, extension)
+    _live_search(window, query, extension)
+    _last_calls[window] = time.time()
 
 
-def _live_search(window, search_query):
-    global preview_panels, search_results
-    if len(search_query) < 5:
+def _live_search(window, search_query, extension):
+    global preview_panels, search_results, current_sel, current_text
+    if len(search_query) < 3:
         return
 
     folders = window.folders()
@@ -188,16 +265,20 @@ def _live_search(window, search_query):
 
     cmd = (
         """
-        rg -t py --no-heading --max-filesize 100M --max-count 100 --follow --line-number --fixed-strings %(rg_search)s  %(base_dir)s | fzf --filter %(search_query)s | head -n50
-        """.strip()
+        rg -t %(extension)s --no-heading --max-filesize 100M --max-count 10000 --follow --line-number --fixed-strings %(rg_search)s %(base_dir)s
+        | fzf --filter %(search_query)s
+        | head -n50
+        """.strip().replace("\n", " ")
         % {
+            "extension": shlex.quote(extension),
             "base_dir": " ".join(shlex.quote(d) for d in folders),
             "rg_search": " ".join(f"-e {shlex.quote(p)}" for p in rg_search),
             "search_query": shlex.quote(search_query),
         }
     )
 
-    print(cmd)
+    # print(cmd)
+    print("run", search_query)
 
     search_results = []
 
@@ -207,7 +288,7 @@ def _live_search(window, search_query):
         path, line_number, content = line.split(":", 2)
         to_trim = next((i for i, s in enumerate(content) if s.strip()), 0)
         content = content.strip()
-        print(path, line_number, content)
+        # print(path, line_number, content)
 
         search_results.append(
             SearchResult(
@@ -218,11 +299,11 @@ def _live_search(window, search_query):
             )
         )
 
-    quick_panel = _get_quick_panel(window)
-    if quick_panel:
-        search_query = quick_panel.substr(sublime.Region(0, quick_panel.size()))
+    if command_panel := _get_command_panel(window):
+        current_text = command_panel.substr(sublime.Region(0, command_panel.size()))
+        current_sel = [s.to_tuple() for s in command_panel.sel()]
     window.run_command("hide_overlay")
-    window.run_command("telescope", {"text": search_query})
+    window.run_command("telescope")
 
 
 def _next_result(window, search_results, result_index):
@@ -274,12 +355,21 @@ def _set_file_view_regions(
     )
 
 
-def _get_quick_panel(window):
+def _get_command_panel(window):
     # TODO: is there a better way?
+    # Because of the debounced, the view can be destroyed if we are late
     for n in range(1000):
         view = sublime.View(n)
-        if view.element() != "quick_panel:input":
+        if view.element() != "command_palette:input":
             continue
         if view.window() != window:
             continue
         return view
+
+
+def _fixed_size(s, size):
+    """Make the string having a fixed size."""
+    s = s or ""
+    s = s[:size]
+    s += " " * (size - len(s))
+    return s

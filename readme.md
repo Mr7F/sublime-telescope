@@ -8,6 +8,10 @@ It will **fuzzy find** in all files with a given extension, with an heuristic
 - it will apply fuzzy search on the result with fzf
 - it will keep the 50 first results
 
+<p align="center">
+  <img src="img/demo.gif">
+</p>
+
 > sudo apt install ripgrep fzf
 
 > brew install coreutils ripgrepfzf

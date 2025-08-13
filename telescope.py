@@ -229,35 +229,12 @@ def _live_search(window, search_query, extension):
     fzf_cmd = ["fzf", "--filter", search_query]
     head_cmd = ["head", "-n", "50"]
 
-    cmd_args = {}
     if sys.platform.startswith("win"):
-        CREATE_NO_WINDOW = 0x08000000
-        cmd_args["creationflags"] = CREATE_NO_WINDOW
         head_cmd = ["powershell", "-Command", "$input | Select-Object -First 50"]
 
-    rg_process = subprocess.Popen(
-        rg_cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        **cmd_args,
-    )
-    fzf_process = subprocess.Popen(
-        fzf_cmd,
-        stdin=rg_process.stdout,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        **cmd_args,
-    )
-    head_process = subprocess.Popen(
-        head_cmd,
-        stdin=fzf_process.stdout,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        **cmd_args,
-    )
+    rg_process = _create_process(rg_cmd)
+    fzf_process = _create_process(fzf_cmd, stdin=rg_process.stdout)
+    head_process = _create_process(head_cmd, stdin=fzf_process.stdout)
     rg_process.stdout.close()
     fzf_process.stdout.close()
 
@@ -398,40 +375,16 @@ def _get_valid_file_extensions_update_cache(window):
 
     rg_args.extend(base_dirs)
 
-    cmd_args = {}
     sort_cmd = ["sort", "-u"]
     if sys.platform.startswith("win"):
-        CREATE_NO_WINDOW = 0x08000000
-        cmd_args["creationflags"] = CREATE_NO_WINDOW
         sort_cmd = ["powershell", "-Command", "$input | Sort-Object -Unique"]
 
-    rg_process = subprocess.Popen(
-        rg_args,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        shell=False,
-        **cmd_args,
-    )
-    sed_process = subprocess.Popen(
+    rg_process = _create_process(rg_args)
+    sed_process = _create_process(
         ["sed", "-n", r"s/.*\(\.[^/]*\)$/\1/p"],
         stdin=rg_process.stdout,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        shell=False,
-        **cmd_args,
     )
-
-    downstream_process = subprocess.Popen(
-        sort_cmd,
-        stdin=sed_process.stdout,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        shell=False,
-        **cmd_args,
-    )
+    downstream_process = _create_process(sort_cmd, stdin=sed_process.stdout)
     rg_process.stdout.close()
     sed_process.stdout.close()
 
@@ -453,3 +406,20 @@ def _parse_rg_result(result):
         path = drive + ":" + path
         return path, line_number, content
     return result.split(":", 2)
+
+
+def _create_process(args, stdin=None):
+    cmd_args = {}
+    if sys.platform.startswith("win"):
+        CREATE_NO_WINDOW = 0x08000000
+        cmd_args["creationflags"] = CREATE_NO_WINDOW
+    if stdin is not None:
+        cmd_args["stdin"] = stdin
+    return subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        shell=False,
+        **cmd_args,
+    )

@@ -125,7 +125,8 @@ class TelescopeListInputHandler(DynamicListInputHandler):
             )
 
     def on_modified(self, text: str) -> None:
-        global search_results
+        global search_results, current_highlight_index
+        current_highlight_index = -1
         search_results = _live_search(
             self.window_command.window,
             text,

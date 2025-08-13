@@ -12,9 +12,16 @@ It will **fuzzy find** in all files with a given extension, with an heuristic
   <img src="img/demo.gif">
 </p>
 
+Debian / Ubuntu
 > sudo apt install ripgrep fzf
 
+MacOS
 > brew install coreutils ripgrepfzf
+
+Windows with choco
+>  Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+
+> choco install ripgrep sed fzf
 
 # Keybind
 ```json

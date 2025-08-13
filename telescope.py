@@ -1,9 +1,10 @@
 from dataclasses import dataclass
 import sublime
 import sublime_plugin
-import shlex
 import os
 import time
+import sys
+import subprocess
 
 
 # LSP "Go to symbols" has a similar feature
@@ -208,25 +209,65 @@ def _live_search(window, search_query, extension):
         rg_search[len(rg_search) // 2],
     }
 
-    cmd = (
-        """
-        rg -t %(extension)s --no-heading --max-filesize 100M --max-count 10000 --follow --line-number --fixed-strings %(rg_search)s %(base_dir)s
-        | fzf --filter %(search_query)s
-        | head -n50
-        """.strip().replace("\n", " ")
-        % {
-            "extension": shlex.quote(extension),
-            "base_dir": " ".join(shlex.quote(d) for d in window.folders()),
-            "rg_search": " ".join(f"-e {shlex.quote(p)}" for p in rg_search),
-            "search_query": shlex.quote(search_query),
-        }
+    rg_cmd = [
+        "rg",
+        "-t",
+        extension,
+        "--no-heading",
+        "--max-filesize",
+        "100M",
+        "--max-count",
+        "10000",
+        "--follow",
+        "--line-number",
+        "--fixed-strings",
+    ]
+    for pattern in rg_search:
+        rg_cmd += ["-e", pattern]
+    rg_cmd += window.folders()
+
+    fzf_cmd = ["fzf", "--filter", search_query]
+    head_cmd = ["head", "-n", "50"]
+
+    cmd_args = {}
+    if sys.platform.startswith("win"):
+        CREATE_NO_WINDOW = 0x08000000
+        cmd_args["creationflags"] = CREATE_NO_WINDOW
+        head_cmd = ["powershell", "-Command", "$input | Select-Object -First 50"]
+
+    rg_process = subprocess.Popen(
+        rg_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        **cmd_args,
     )
+    fzf_process = subprocess.Popen(
+        fzf_cmd,
+        stdin=rg_process.stdout,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        **cmd_args,
+    )
+    head_process = subprocess.Popen(
+        head_cmd,
+        stdin=fzf_process.stdout,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        **cmd_args,
+    )
+    rg_process.stdout.close()
+    fzf_process.stdout.close()
+
+    output, errors = head_process.communicate()
 
     search_results = []
-    for i, line in enumerate(os.popen(cmd).readlines()):
+    for _, line in enumerate(output.splitlines()):
         if not line.strip():
             continue
-        path, line_number, content = line.split(":", 2)
+        path, line_number, content = _parse_rg_result(line)
         to_trim = next((i for i, s in enumerate(content) if s.strip()), 0)
         content = content.strip()
 
@@ -329,24 +370,73 @@ def _get_valid_file_extensions_update_cache(window):
     print("Update extensions cache")
 
     view = window.active_view()
+    if not view:
+        return
+
     exclude_patterns = view.settings().get("binary_file_patterns") or []
     exclude_patterns += view.settings().get("file_exclude_patterns") or []
     exclude_patterns += [
         f"**/{f}**/" for f in view.settings().get("folder_exclude_patterns") or []
     ]
 
-    glob = " ".join(f"--iglob {shlex.quote('!' + e)}" for e in exclude_patterns)
-    cmd = (
-        """
-        rg  --no-heading --follow --max-filesize 100M --files --fixed-strings %(glob)s %(base_dir)s | sed -n 's/.*\(\.[^/]*\)$/\\1/p' | sort -u
-        """.strip().replace("\n", " ")
-        % {
-            "base_dir": " ".join(shlex.quote(d) for d in window.folders()),
-            "glob": glob,
-        }
+    rg_args = [
+        "rg",
+        "--no-heading",
+        "--follow",
+        "--max-filesize",
+        "100M",
+        "--files",
+        "--fixed-strings",
+    ]
+
+    for pattern in exclude_patterns:
+        rg_args.extend(["--iglob", f"!{pattern}"])
+
+    base_dirs = window.folders()
+    if not base_dirs:
+        return
+
+    rg_args.extend(base_dirs)
+
+    cmd_args = {}
+    sort_cmd = ["sort", "-u"]
+    if sys.platform.startswith("win"):
+        CREATE_NO_WINDOW = 0x08000000
+        cmd_args["creationflags"] = CREATE_NO_WINDOW
+        sort_cmd = ["powershell", "-Command", "$input | Sort-Object -Unique"]
+
+    rg_process = subprocess.Popen(
+        rg_args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        shell=False,
+        **cmd_args,
+    )
+    sed_process = subprocess.Popen(
+        ["sed", "-n", r"s/.*\(\.[^/]*\)$/\1/p"],
+        stdin=rg_process.stdout,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        shell=False,
+        **cmd_args,
     )
 
-    extensions = [e.strip()[1:] for e in os.popen(cmd).readlines()]
+    downstream_process = subprocess.Popen(
+        sort_cmd,
+        stdin=sed_process.stdout,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        shell=False,
+        **cmd_args,
+    )
+    rg_process.stdout.close()
+    sed_process.stdout.close()
+
+    stdout, stderr = downstream_process.communicate()
+    extensions = [e.strip()[1:] for e in stdout.splitlines()]
 
     default = None
     if file_name := view.file_name():
@@ -355,3 +445,11 @@ def _get_valid_file_extensions_update_cache(window):
             extensions.append(default)
 
     _extension_cache[window] = extensions, default
+
+
+def _parse_rg_result(result):
+    if sys.platform.startswith("win"):
+        drive, path, line_number, content = result.split(":", 3)
+        path = drive + ":" + path
+        return path, line_number, content
+    return result.split(":", 2)

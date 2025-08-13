@@ -4,7 +4,7 @@ from abc import ABCMeta
 from abc import abstractmethod
 from typing import Any, Callable, List, Tuple, Union
 from typing import final
-from typing_extensions import ParamSpec
+# from typing_extensions import ParamSpec
 import functools
 import sublime
 import sublime_plugin
@@ -16,7 +16,7 @@ ST_VERSION = int(sublime.version())
 ListItemsReturn = Union[List[str], Tuple[List[str], int], List[Tuple[str, Any]], Tuple[List[Tuple[str, Any]], int],
                         List[sublime.ListInputItem], Tuple[List[sublime.ListInputItem], int]]
 
-P = ParamSpec('P')
+# P = ParamSpec('P')
 
 
 def debounced(user_function: Callable[P, Any]) -> Callable[P, None]:

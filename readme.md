@@ -14,6 +14,8 @@ It will **fuzzy find** in all files with a given extension, with an heuristic
 
 Ripgrep and fzf are configured in **"smart case"** mode (case insensitive if everything is lower case, case sensitive otherwise).
 
+When selecting the file extension, you can hold shift while pressing enter to select many extensions.
+
 Debian / Ubuntu
 > sudo apt install ripgrep fzf
 

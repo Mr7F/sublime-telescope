@@ -1,3 +1,4 @@
+from collections import defaultdict
 from dataclasses import dataclass
 import sublime
 import sublime_plugin
@@ -17,8 +18,8 @@ init_active_view = {}  # {window: view}
 init_view_sel = {}  # {window: {view: sel}}
 preview_panels = {}
 
-current_extension = ""
-current_highlight_index = -1
+current_extensions = defaultdict(list)
+current_highlight_index = defaultdict(lambda: -1)
 
 search_results = ()
 
@@ -36,9 +37,9 @@ class SearchResult:
 class TelescopeCommand(sublime_plugin.WindowCommand):
     """Executed on the output panel, set the result in the view."""
 
-    def run(self, extension, result):
+    def run(self, result, extension_0, **kwargs):
         global search_results
-        print("run command", extension, result)
+        print("run command", extension_0, result)
 
         for view in self.window.views(include_transient=True):
             view.erase_regions("telescope-result-view")
@@ -55,34 +56,73 @@ class TelescopeCommand(sublime_plugin.WindowCommand):
 
 
 class ExtensionInputHandler(PreselectedListInputHandler):
-    def __init__(self, window_command):
+    def __init__(self, window_command, extension_i=0):
+        print("ExtensionInputHandler", window_command, extension_i)
+        self.window = window_command.window
         self.window_command = window_command
+        self.extension_i = extension_i
 
         self.extensions, default = _get_valid_file_extensions(
             self.window_command.window
         )
-        super().__init__(window_command.window, current_extension or default)
+
+        if extension_i < len(current_extensions[self.window]):
+            default = current_extensions[self.window][extension_i]
+        elif extension_i != 0:
+            default = None
+
+        super().__init__(self.window, default)
 
     def get_list_items(self):
+        if self.extension_i > 0:
+            return [("Start searching...", "")] + [(e, e) for e in self.extensions]
         return self.extensions
 
+    def want_event(self):
+        return True
+
+    def description(self, value, name):
+        return name if value else None
+
     def name(self):
-        return "extension"
+        return f"extension_{self.extension_i}"
 
     def placeholder(self):
         return "File Extension"
 
+    def confirm(self, value, event):
+        self._add_more = event.get("modifier_keys", {}).get("shift")
+
     def next_input(self, args):
-        global current_extension
-        current_extension = args[self.name()]
+        global current_extensions
+        if not args[self.name()]:
+            # We chose "Start searching"
+            current_extensions[self.window] = current_extensions[self.window][
+                : self.extension_i
+            ]
+            return TelescopeListInputHandler(self.window_command, args)
+
+        if self.extension_i >= len(current_extensions[self.window]):
+            current_extensions[self.window].append(args[self.name()])
+        elif current_extensions[self.window][self.extension_i] != args[self.name()]:
+            current_extensions[self.window][self.extension_i] = args[self.name()]
+
+        if self._add_more or self.extension_i + 1 < len(
+            current_extensions[self.window]
+        ):
+            return ExtensionInputHandler(self.window_command, self.extension_i + 1)
+
         if "result" not in args:
             return TelescopeListInputHandler(self.window_command, args)
 
 
 class TelescopeListInputHandler(DynamicListInputHandler):
     def __init__(self, window_command, args):
+        global search_results
         super().__init__(window_command, args)
+        self.window = window_command.window
         self.window_command = window_command
+        self.search_results = list(search_results)
 
     def name(self):
         return "result"
@@ -97,8 +137,6 @@ class TelescopeListInputHandler(DynamicListInputHandler):
         _reset_initial_state(self.window_command.window)
 
     def validate(self, text):
-        global search_results
-
         if not (text or "").strip():
             return False
 
@@ -116,21 +154,27 @@ class TelescopeListInputHandler(DynamicListInputHandler):
         at the same position.
         """
         global current_highlight_index
+        print("preview", len(self.search_results), text)
         if (text or "").strip():
-            current_highlight_index = int(text.split(":", 1)[0])
+            current_highlight_index[self.window] = int(text.split(":", 1)[0])
             _preview_result(
                 self.window_command.window,
-                search_results,
-                current_highlight_index,
+                self.search_results,
+                current_highlight_index[self.window],
             )
 
     def on_modified(self, text: str) -> None:
         global search_results, current_highlight_index
-        current_highlight_index = -1
+        current_highlight_index[self.window] = -1
+
+        extensions = {
+            v for n, v in self.args.items() if n.startswith("extension_") and v
+        }
+
         search_results = _live_search(
             self.window_command.window,
             text,
-            self.args["extension"],
+            extensions,
         )
 
         setattr(
@@ -141,7 +185,7 @@ class TelescopeListInputHandler(DynamicListInputHandler):
         self.update(self._list_items(search_results))
 
     def get_list_items(self):
-        return self._list_items(search_results)
+        return self._list_items(self.search_results)
 
     def _list_items(self, search_results):
         if not search_results:
@@ -158,7 +202,7 @@ class TelescopeListInputHandler(DynamicListInputHandler):
                 annotation="",
             )
             for i, s in enumerate(search_results)
-        ], current_highlight_index
+        ], current_highlight_index[self.window]
 
 
 class IoPanelEventListener(sublime_plugin.EventListener):
@@ -194,7 +238,7 @@ def _reset_initial_state(window, focus_old_view=True, close_preview=False):
             view.sel().add_all(sel)
 
 
-def _live_search(window, search_query, extension):
+def _live_search(window, search_query, extensions):
     global preview_panels, search_results
     if len(search_query) < 3:
         return
@@ -213,8 +257,6 @@ def _live_search(window, search_query, extension):
 
     rg_cmd = [
         "rg",
-        "-t",
-        extension,
         "--no-heading",
         "--max-filesize",
         "100M",
@@ -225,6 +267,12 @@ def _live_search(window, search_query, extension):
         "--fixed-strings",
         "--smart-case",
     ]
+
+    print("extensions", extensions)
+    for e in extensions:
+        # `--type` exist, but it works only for a fixed list of types
+        rg_cmd.extend(("--iglob", f"*.{e}"))
+
     for pattern in rg_search:
         rg_cmd += ["-e", pattern]
     rg_cmd += window.folders()
@@ -269,6 +317,8 @@ def _preview_result(window, search_results, result_index):
     if (
         window not in preview_panels
         or preview_panels[window].file_name() != search_results[result_index].path
+        or not preview_panels[window].sheet()
+        or not preview_panels[window].sheet().is_selected()
     ):
         preview_panels[window] = window.open_file(
             search_results[result_index].path,
@@ -389,10 +439,10 @@ def _get_valid_file_extensions_update_cache(window):
     rg_process.terminate()
 
     default = None
-    if file_name := view.file_name():
+    if (file_name := view.file_name()) and "." in file_name:
         default = file_name.rsplit(".", 1)[-1]
         extensions.add(default)
-    extensions = list(extensions)
+    extensions = [e for e in extensions if "/" not in e]
     _extension_cache[window] = extensions, default
     print("Extensions cache updated in ", time.time() - start, "seconds")
 

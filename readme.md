@@ -3,7 +3,7 @@ Sublime text plugin that mimic the "live grep" feature of the [telescope](https:
 
 That plugin work with [ripgrep](https://github.com/BurntSushi/ripgrep) and [fzf](https://github.com/junegunn/fzf)
 
-It will **fuzzy find** in all files with a given extension, with an heuristic
+It will **fuzzy find** in all files following a glob expression, with an heuristic
 - it will first use ripgrep with the 3 first characters and the 3 last ones
 - it will apply fuzzy search on the result with fzf
 - it will keep the 50 first results
@@ -14,7 +14,11 @@ It will **fuzzy find** in all files with a given extension, with an heuristic
 
 Ripgrep and fzf are configured in **"smart case"** mode (case insensitive if everything is lower case, case sensitive otherwise).
 
-When selecting the file extension, you can hold shift while pressing enter to select many extensions.
+To reduce the search space, you first need to write a glob filter to apply on the files, like the sublime text search, you can specify many globs separated by a comma:
+- `models/*.py`
+- `.py`
+- `.py, .js`
+- `/views/*/src/*.html`
 
 Debian / Ubuntu
 > sudo apt install ripgrep fzf

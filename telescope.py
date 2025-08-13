@@ -1,6 +1,7 @@
 from collections import defaultdict
 from dataclasses import dataclass
 import sublime
+import re
 import sublime_plugin
 import time
 import sys
@@ -10,7 +11,7 @@ import subprocess
 # LSP "Go to symbols" has a similar feature
 # Hope this issue is fixed one day...
 # > https://github.com/sublimehq/sublime_text/issues/4796
-from .utils import DynamicListInputHandler, PreselectedListInputHandler
+from .utils import DynamicListInputHandler
 
 
 regions_to_add = {}
@@ -18,7 +19,7 @@ init_active_view = {}  # {window: view}
 init_view_sel = {}  # {window: {view: sel}}
 preview_panels = {}
 
-current_extensions = defaultdict(list)
+current_globs = defaultdict(str)
 current_highlight_index = defaultdict(lambda: -1)
 
 search_results = ()
@@ -37,9 +38,8 @@ class SearchResult:
 class TelescopeCommand(sublime_plugin.WindowCommand):
     """Executed on the output panel, set the result in the view."""
 
-    def run(self, result, extension_0, **kwargs):
+    def run(self, result, globs):
         global search_results
-        print("run command", extension_0, result)
 
         for view in self.window.views(include_transient=True):
             view.erase_regions("telescope-result-view")
@@ -52,66 +52,46 @@ class TelescopeCommand(sublime_plugin.WindowCommand):
         # when reloading the command input with the hack in `utils.py`
         if not args:
             _save_initial_state(self.window)
-        return ExtensionInputHandler(self)
+        return GlobsInputHandler(self, current_globs[self.window])
 
 
-class ExtensionInputHandler(PreselectedListInputHandler):
-    def __init__(self, window_command, extension_i=0):
-        print("ExtensionInputHandler", window_command, extension_i)
+class GlobsInputHandler(sublime_plugin.TextInputHandler):
+    def __init__(self, window_command, initial_value):
         self.window = window_command.window
         self.window_command = window_command
-        self.extension_i = extension_i
+        self._initial_value = initial_value or None
 
-        self.extensions, default = _get_valid_file_extensions(
-            self.window_command.window
-        )
+    def validate(self, text):
+        return bool((text or "").strip())
 
-        if extension_i < len(current_extensions[self.window]):
-            default = current_extensions[self.window][extension_i]
-        elif extension_i != 0:
-            default = None
+    def initial_text(self):
+        if current_globs[self.window]:
+            if self._initial_value is not None:
+                sublime.set_timeout(self._select_and_reset)
+            return current_globs[self.window]
 
-        super().__init__(self.window, default)
+        if (file_name := self.window.active_view().file_name()) and "." in file_name:
+            return file_name.rsplit(".", 1)[-1]
 
-    def get_list_items(self):
-        if self.extension_i > 0:
-            return [("Start searching...", "")] + [(e, e) for e in self.extensions]
-        return self.extensions
-
-    def want_event(self):
-        return True
-
-    def description(self, value, name):
-        return name if value else None
+    def _select_and_reset(self) -> None:
+        # See: https://github.com/sublimehq/sublime_text/issues/5507
+        # Taken from the "LSP Go to symbols" and adapted for Text input
+        self._initial_value = None
+        if self.window.is_valid():
+            self.window.run_command("select")
 
     def name(self):
-        return f"extension_{self.extension_i}"
+        return "globs"
 
     def placeholder(self):
-        return "File Extension"
-
-    def confirm(self, value, event):
-        self._add_more = event.get("modifier_keys", {}).get("shift")
+        return ".py, .js, views/*.html"
 
     def next_input(self, args):
-        global current_extensions
-        if not args[self.name()]:
-            # We chose "Start searching"
-            current_extensions[self.window] = current_extensions[self.window][
-                : self.extension_i
-            ]
-            return TelescopeListInputHandler(self.window_command, args)
+        global current_globs
 
-        if self.extension_i >= len(current_extensions[self.window]):
-            current_extensions[self.window].append(args[self.name()])
-        elif current_extensions[self.window][self.extension_i] != args[self.name()]:
-            current_extensions[self.window][self.extension_i] = args[self.name()]
-
-        if self._add_more or self.extension_i + 1 < len(
-            current_extensions[self.window]
-        ):
-            return ExtensionInputHandler(self.window_command, self.extension_i + 1)
-
+        current_globs[self.window] = ", ".join(
+            g.strip() for g in args[self.name()].split(",")
+        )
         if "result" not in args:
             return TelescopeListInputHandler(self.window_command, args)
 
@@ -154,7 +134,6 @@ class TelescopeListInputHandler(DynamicListInputHandler):
         at the same position.
         """
         global current_highlight_index
-        print("preview", len(self.search_results), text)
         if (text or "").strip():
             current_highlight_index[self.window] = int(text.split(":", 1)[0])
             _preview_result(
@@ -167,14 +146,10 @@ class TelescopeListInputHandler(DynamicListInputHandler):
         global search_results, current_highlight_index
         current_highlight_index[self.window] = -1
 
-        extensions = {
-            v for n, v in self.args.items() if n.startswith("extension_") and v
-        }
-
         search_results = _live_search(
             self.window_command.window,
             text,
-            extensions,
+            self.args["globs"],
         )
 
         setattr(
@@ -238,10 +213,10 @@ def _reset_initial_state(window, focus_old_view=True, close_preview=False):
             view.sel().add_all(sel)
 
 
-def _live_search(window, search_query, extensions):
+def _live_search(window, search_query, globs):
     global preview_panels, search_results
     if len(search_query) < 3:
-        return
+        return []
 
     start = time.time()
 
@@ -268,14 +243,18 @@ def _live_search(window, search_query, extensions):
         "--smart-case",
     ]
 
-    print("extensions", extensions)
-    for e in extensions:
+    for glob in globs.split(","):
+        glob = glob.strip()
+        glob = re.sub(r"\*+", "**", glob)
         # `--type` exist, but it works only for a fixed list of types
-        rg_cmd.extend(("--iglob", f"*.{e}"))
+        # mimic sublime text glob logic
+        rg_cmd.extend(("--iglob", f"**/*{glob}"))
 
     for pattern in rg_search:
         rg_cmd += ["-e", pattern]
     rg_cmd += window.folders()
+
+    print(" ".join(rg_cmd))
 
     rg_process = _create_process(rg_cmd)
     fzf_process = _create_process(
@@ -367,84 +346,6 @@ def _fixed_size(s, size):
     s = s[:size]
     s += " " * (size - len(s))
     return s
-
-
-_extension_cache = {}  # {window: [extension]}
-_last_extension_update = {}  # {window: last_update_time}
-_max_extension_update_seconds = 5
-
-
-def _get_valid_file_extensions(window):
-    # Execute the first time, the second time returns the cached value
-    # and update the cache in background
-    global _last_extension_update, _extension_cache
-    if window not in _extension_cache:
-        _last_extension_update[window] = time.time()
-        _get_valid_file_extensions_update_cache(window)
-
-    elif (
-        window not in _last_extension_update
-        or _last_extension_update[window] + _max_extension_update_seconds < time.time()
-    ):
-        _last_extension_update[window] = time.time()  # Needs to be sync
-        sublime.set_timeout_async(
-            lambda: _get_valid_file_extensions_update_cache(window)
-        )
-
-    return _extension_cache[window]
-
-
-def _get_valid_file_extensions_update_cache(window):
-    global _last_extension_update, _extension_cache
-
-    view = window.active_view()
-    if not view:
-        return
-
-    start = time.time()
-    exclude_patterns = view.settings().get("binary_file_patterns") or []
-    exclude_patterns += view.settings().get("file_exclude_patterns") or []
-    exclude_patterns += [
-        f"**/{f}**/" for f in view.settings().get("folder_exclude_patterns") or []
-    ]
-
-    rg_args = [
-        "rg",
-        "--no-heading",
-        "--follow",
-        "--max-filesize",
-        "100M",
-        "--files",
-        "--fixed-strings",
-    ]
-
-    for pattern in exclude_patterns:
-        rg_args.extend(["--iglob", f"!{pattern}"])
-
-    base_dirs = window.folders()
-    if not base_dirs:
-        return
-
-    rg_args.extend(base_dirs)
-
-    rg_process = _create_process(rg_args)
-    extensions = set()
-    while True:
-        line = rg_process.stdout.readline().strip()
-        if not line:
-            break
-        if "." in line:
-            extensions.add(line.rsplit(".", 1)[-1])
-
-    rg_process.terminate()
-
-    default = None
-    if (file_name := view.file_name()) and "." in file_name:
-        default = file_name.rsplit(".", 1)[-1]
-        extensions.add(default)
-    extensions = [e for e in extensions if "/" not in e]
-    _extension_cache[window] = extensions, default
-    print("Extensions cache updated in ", time.time() - start, "seconds")
 
 
 def _parse_rg_result(result):

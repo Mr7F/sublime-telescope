@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 import sublime
 import sublime_plugin
-import os
 import time
 import sys
 import subprocess
@@ -199,6 +198,8 @@ def _live_search(window, search_query, extension):
     if len(search_query) < 3:
         return
 
+    start = time.time()
+
     # Heuristic to filter result with ripgrep first
     rg_search = []
     for i in range(len(search_query) - 2):
@@ -226,24 +227,18 @@ def _live_search(window, search_query, extension):
         rg_cmd += ["-e", pattern]
     rg_cmd += window.folders()
 
-    fzf_cmd = ["fzf", "--filter", search_query]
-    head_cmd = ["head", "-n", "50"]
-
-    if sys.platform.startswith("win"):
-        head_cmd = ["powershell", "-Command", "$input | Select-Object -First 50"]
-
     rg_process = _create_process(rg_cmd)
-    fzf_process = _create_process(fzf_cmd, stdin=rg_process.stdout)
-    head_process = _create_process(head_cmd, stdin=fzf_process.stdout)
+    fzf_process = _create_process(
+        ["fzf", "--filter", search_query],
+        stdin=rg_process.stdout,
+    )
     rg_process.stdout.close()
-    fzf_process.stdout.close()
-
-    output, errors = head_process.communicate()
-
     search_results = []
-    for _, line in enumerate(output.splitlines()):
-        if not line.strip():
-            continue
+    for _ in range(50):  # Read first X lines
+        line = fzf_process.stdout.readline().strip()
+        if not line:
+            break
+
         path, line_number, content = _parse_rg_result(line)
         to_trim = next((i for i, s in enumerate(content) if s.strip()), 0)
         content = content.strip()
@@ -256,6 +251,11 @@ def _live_search(window, search_query, extension):
                 content[:200],
             )
         )
+
+    rg_process.terminate()
+    fzf_process.terminate()
+
+    print("Search done in", time.time() - start)
 
     return search_results
 
@@ -344,12 +344,12 @@ def _get_valid_file_extensions(window):
 
 def _get_valid_file_extensions_update_cache(window):
     global _last_extension_update, _extension_cache
-    print("Update extensions cache")
 
     view = window.active_view()
     if not view:
         return
 
+    start = time.time()
     exclude_patterns = view.settings().get("binary_file_patterns") or []
     exclude_patterns += view.settings().get("file_exclude_patterns") or []
     exclude_patterns += [
@@ -375,29 +375,24 @@ def _get_valid_file_extensions_update_cache(window):
 
     rg_args.extend(base_dirs)
 
-    sort_cmd = ["sort", "-u"]
-    if sys.platform.startswith("win"):
-        sort_cmd = ["powershell", "-Command", "$input | Sort-Object -Unique"]
-
     rg_process = _create_process(rg_args)
-    sed_process = _create_process(
-        ["sed", "-n", r"s/.*\(\.[^/]*\)$/\1/p"],
-        stdin=rg_process.stdout,
-    )
-    downstream_process = _create_process(sort_cmd, stdin=sed_process.stdout)
-    rg_process.stdout.close()
-    sed_process.stdout.close()
+    extensions = set()
+    while True:
+        line = rg_process.stdout.readline().strip()
+        if not line:
+            break
+        if "." in line:
+            extensions.add(line.rsplit(".", 1)[-1])
 
-    stdout, stderr = downstream_process.communicate()
-    extensions = [e.strip()[1:] for e in stdout.splitlines()]
+    rg_process.terminate()
 
     default = None
     if file_name := view.file_name():
         default = file_name.rsplit(".", 1)[-1]
-        if default not in extensions:
-            extensions.append(default)
-
+        extensions.add(default)
+    extensions = list(extensions)
     _extension_cache[window] = extensions, default
+    print("Extensions cache updated in ", time.time() - start, "seconds")
 
 
 def _parse_rg_result(result):

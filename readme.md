@@ -12,6 +12,8 @@ It will **fuzzy find** in all files with a given extension, with an heuristic
   <img src="img/demo.gif">
 </p>
 
+Ripgrep and fzf are configured in **"smart case"** mode (case insensitive if everything is lower case, case sensitive otherwise).
+
 Debian / Ubuntu
 > sudo apt install ripgrep fzf
 

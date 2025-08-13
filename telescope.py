@@ -223,6 +223,7 @@ def _live_search(window, search_query, extension):
         "--follow",
         "--line-number",
         "--fixed-strings",
+        "--smart-case",
     ]
     for pattern in rg_search:
         rg_cmd += ["-e", pattern]

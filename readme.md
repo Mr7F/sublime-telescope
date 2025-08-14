@@ -15,6 +15,7 @@ It will **fuzzy find** in all files following a glob expression, with an heurist
 Ripgrep and fzf are configured in **"smart case"** mode (case insensitive if everything is lower case, case sensitive otherwise).
 
 To reduce the search space, you first need to write a glob filter to apply on the files, like the sublime text search, you can specify many globs separated by a comma:
+- `<empty>`: use the default ripgrep filters (follow `gitignore`, skip hidden files and binary, etc)
 - `models/*.py`
 - `.py`
 - `.py, .js`

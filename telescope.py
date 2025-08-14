@@ -59,19 +59,20 @@ class GlobsInputHandler(sublime_plugin.TextInputHandler):
     def __init__(self, window_command, initial_value):
         self.window = window_command.window
         self.window_command = window_command
-        self._initial_value = initial_value or None
+        self._initial_value = initial_value or ""
 
     def validate(self, text):
-        return bool((text or "").strip())
+        return not text or bool((text or "").strip())
+
+    def description(self, value):
+        if not value and value is not None:
+            return "All"
+        return value
 
     def initial_text(self):
-        if current_globs[self.window]:
-            if self._initial_value is not None:
-                sublime.set_timeout(self._select_and_reset)
-            return current_globs[self.window]
-
-        if (file_name := self.window.active_view().file_name()) and "." in file_name:
-            return file_name.rsplit(".", 1)[-1]
+        if self._initial_value is not None:
+            sublime.set_timeout(self._select_and_reset)
+        return self._initial_value
 
     def _select_and_reset(self) -> None:
         # See: https://github.com/sublimehq/sublime_text/issues/5507
@@ -117,10 +118,7 @@ class TelescopeListInputHandler(DynamicListInputHandler):
         _reset_initial_state(self.window_command.window)
 
     def validate(self, text):
-        if not (text or "").strip():
-            return False
-
-        return True
+        return bool((text or "").strip())
 
     def initial_selection(self):
         if hasattr(self.command, "_selection"):
@@ -245,6 +243,8 @@ def _live_search(window, search_query, globs):
 
     for glob in globs.split(","):
         glob = glob.strip()
+        if not glob:
+            continue
         glob = re.sub(r"\*+", "**", glob)
         # `--type` exist, but it works only for a fixed list of types
         # mimic sublime text glob logic

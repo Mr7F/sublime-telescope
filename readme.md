@@ -3,8 +3,8 @@ Sublime text plugin that mimic the "live grep" feature of the [telescope](https:
 
 That plugin work with [ripgrep](https://github.com/BurntSushi/ripgrep) and [fzf](https://github.com/junegunn/fzf)
 
-It will **fuzzy find** in all files following a glob expression, with an heuristic
-- it will first use ripgrep with the 3 first characters and the 3 last ones
+It will **fuzzy find** in all files following a glob expression,
+- it will first use ripgrep, if you enter `acbd`, it will look for the regex `.*a.*b.*c.*d.*`
 - it will apply fuzzy search on the result with fzf
 - it will keep the 50 first results
 
@@ -20,6 +20,11 @@ To reduce the search space, you first need to write a glob filter to apply on th
 - `.py`
 - `.py, .js`
 - `/views/*/src/*.html`
+
+In addition to the default `ripgrep` behavior (ignoring file specified in `.gitignore`, etc), it will ignore files matching
+- `binary_file_patterns`
+- `file_exclude_patterns`
+- `folder_exclude_patterns`
 
 Debian / Ubuntu
 > sudo apt install ripgrep fzf

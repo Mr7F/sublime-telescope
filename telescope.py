@@ -218,16 +218,6 @@ def _live_search(window, search_query, globs):
 
     start = time.time()
 
-    # Heuristic to filter result with ripgrep first
-    rg_search = []
-    for i in range(len(search_query) - 2):
-        rg_search.append(search_query[i : i + 3])
-    rg_search = {
-        rg_search[0],
-        rg_search[-1],
-        rg_search[len(rg_search) // 2],
-    }
-
     rg_cmd = [
         "rg",
         "--no-heading",
@@ -237,9 +227,23 @@ def _live_search(window, search_query, globs):
         "10000",
         "--follow",
         "--line-number",
-        "--fixed-strings",
         "--smart-case",
+        "-e",
+        ".*" + ".*".join(map(re.escape, search_query)) + ".*",
     ]
+
+    view = window.active_view()
+    if view:
+        # The `--iglob` when is negated is done in addition to the
+        # default filter (.gitignore, etc)
+        exclude_patterns = view.settings().get("binary_file_patterns") or []
+        exclude_patterns += view.settings().get("file_exclude_patterns") or []
+        exclude_patterns += [
+            f"**/{f}**/" for f in view.settings().get("folder_exclude_patterns") or []
+        ]
+        for glob in exclude_patterns:
+            glob = re.sub(r"\*+", "**", glob)
+            rg_cmd.extend(("--iglob", f"!**/*{glob}"))
 
     for glob in globs.split(","):
         glob = glob.strip()
@@ -250,8 +254,6 @@ def _live_search(window, search_query, globs):
         # mimic sublime text glob logic
         rg_cmd.extend(("--iglob", f"**/*{glob}"))
 
-    for pattern in rg_search:
-        rg_cmd += ["-e", pattern]
     rg_cmd += window.folders()
 
     print(" ".join(rg_cmd))

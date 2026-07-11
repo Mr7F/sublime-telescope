@@ -10,4 +10,8 @@
             "current_file": true
         }
     },
+    {
+        "caption": "Telescope: Set Glob",
+        "command": "telescope_set_globs"
+    },
 ]

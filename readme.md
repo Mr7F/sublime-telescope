@@ -6,15 +6,15 @@ That plugin work with [ripgrep](https://github.com/BurntSushi/ripgrep) and [fzf]
 It will **fuzzy find** in all files following a glob expression,
 - it will first use ripgrep, if you enter `acbd`, it will look for the regex `.*a.*b.*c.*d.*`
 - it will apply fuzzy search on the result with fzf
-- it will keep the 50 first results
+- it will keep the 5000 best results (fzf scoring)
 
-<p align="center">
-  <img src="img/demo.gif">
-</p>
+[![Demo](img/demo.gif)](https://youtu.be/Durb2wwCmD0)
 
-Ripgrep and fzf are configured in **"smart case"** mode (case insensitive if everything is lower case, case sensitive otherwise).
+Ripgrep and fzf are configured in **"smart case"** mode (case insensitive if everything is lower case, case-sensitive otherwise).
 
-To reduce the search space, you first need to write a glob filter to apply on the files, like the sublime text search, you can specify many globs separated by a comma:
+The results are shown in an output panel; use the up/down arrows to navigate them (the highlighted result is previewed), enter to open it and escape to cancel and go back where you was.
+
+To reduce the search space, you can set a glob filter to apply on the files by pressing `shift+esc`, like the sublime text search, you can specify many globs separated by a comma:
 - `<empty>`: use the default ripgrep filters (follow `gitignore`, skip hidden files and binary, etc)
 - `models/*.py`
 - `.py`
@@ -37,6 +37,9 @@ Windows with choco
 
 > choco install ripgrep fzf
 
+# Settings
+See `Preferences > Package Settings > Telescope > Settings` to tweak the number of results, the search debounce delay, the ripgrep arguments, etc.
+
 # Keybind
 ```json
 {
@@ -55,6 +58,4 @@ Search using globs:
 ```
 
 # TODO
-- Use quick panel once that issue is done: https://github.com/sublimehq/sublime_text/issues/4796
-- Change "selected by default" when https://github.com/sublimehq/sublime_text/issues/5507 is merged
 - get the x first result with rg instead of head

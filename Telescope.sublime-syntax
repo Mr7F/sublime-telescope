@@ -1,0 +1,13 @@
+%YAML 1.2
+---
+name: Telescope Results
+scope: text.telescope
+hidden: true
+version: 2
+
+contexts:
+  main:
+    - match: '^([^:]+):( *[0-9]+)$'
+      captures:
+        1: comment.path.telescope
+        2: constant.numeric.line-number.telescope

@@ -24,16 +24,19 @@ class TestTelescope(DeferrableTestCase):
         self.previous_project_data = self.window.project_data()
         self.views_to_close = []
 
-        self.window.set_project_data({
-            "folders": [
-                {
-                    "path": self.project_dir,
-                },
-            ],
-        })
+        self.window.set_project_data(
+            {
+                "folders": [
+                    {
+                        "path": self.project_dir,
+                    },
+                ],
+            }
+        )
 
     def tearDown(self):
         self.window.run_command("hide_overlay")
+        self.window.run_command("telescope_cancel")
         for view in self.window.views(include_transient=True):
             file_name = view.file_name()
             if file_name and file_name.startswith(self.project_dir) and view.is_valid():
@@ -62,20 +65,94 @@ class TestTelescope(DeferrableTestCase):
         yield from self._open_file(seed)
 
         self.window.run_command("telescope")
-        yield from self._replace_input(".py")
+        # As bound to shift+escape in the search input
+        self.window.run_command("telescope_set_globs")
+        yield from self._replace_glob_input(".py")
         yield from self._press_enter()
-        yield from self._replace_input("glob_unique_target")
+        yield from self._replace_search_input("glob_unique_target")
         yield from self._wait_for_preview(target)
-        yield from self._press_enter()
+        yield from self._confirm()
         yield lambda: self.window.active_view().file_name() == target
 
         self.assertEqual(self.window.active_view().file_name(), target)
         self.assertIsNone(self._view_for_file(ignored))
 
+    def test_project_folder_exclude_patterns_hide_results(self):
+        seed = _write(
+            os.path.join(self.project_dir, "seed.py"),
+            "open before searching\n",
+        )
+        target = _write(
+            os.path.join(self.project_dir, "kept", "match.py"),
+            "alpha folder_filter_needle one\n",
+        )
+        _write(
+            os.path.join(self.project_dir, "hidden", "match.py"),
+            "alpha folder_filter_needle one\n",
+        )
+        self.window.set_project_data(
+            {
+                "folders": [
+                    {
+                        "path": self.project_dir,
+                        "folder_exclude_patterns": ["hidden"],
+                    },
+                ],
+            }
+        )
+        yield from self._open_file(seed)
+
+        self.window.run_command("telescope")
+        yield from self._replace_search_input("folder_filter_needle")
+        yield from self._wait_for_preview(target)
+
+        panel = self.window.find_output_panel("telescope")
+        self.assertEqual(
+            panel.substr(sublime.Region(0, panel.size())),
+            "match.py:1",
+        )
+
+    def test_project_folder_include_patterns_limit_results(self):
+        seed = _write(
+            os.path.join(self.project_dir, "social_seed", "seed.py"),
+            "open before searching\n",
+        )
+        target = _write(
+            os.path.join(self.project_dir, "social_app", "deep", "match.py"),
+            "alpha include_filter_needle one\n",
+        )
+        _write(
+            os.path.join(self.project_dir, "documents", "match.py"),
+            "alpha include_filter_needle one\n",
+        )
+        include = os.path.join(self.project_dir, "social*")
+        self.window.set_project_data(
+            {
+                "folders": [
+                    {
+                        "path": self.project_dir,
+                        "file_include_patterns": [include],
+                        "folder_include_patterns": [include],
+                    },
+                ],
+            }
+        )
+        yield from self._open_file(seed)
+
+        self.window.run_command("telescope")
+        yield from self._replace_search_input("include_filter_needle")
+        yield from self._wait_for_preview(target)
+
+        panel = self.window.find_output_panel("telescope")
+        self.assertEqual(
+            panel.substr(sublime.Region(0, panel.size())),
+            "match.py:1",
+        )
+
     def test_current_file_search_opens_only_the_active_file(self):
         current = _write(
             os.path.join(self.project_dir, "current.py"),
-            "one\nneedle_current_file in active file\n",
+            "one\nxxx needle_current_file in active file\n",
         )
         _write(
             os.path.join(self.project_dir, "other.py"),
@@ -84,15 +161,25 @@ class TestTelescope(DeferrableTestCase):
         yield from self._open_file(current)
 
         self.window.run_command("telescope", {"current_file": True})
-        yield from self._replace_input("needle_current_file")
+        yield from self._replace_search_input("needle_current_file")
         yield from self._wait_for_preview(current)
-        yield from self._press_enter()
+        panel = self.window.find_output_panel("telescope")
+
+        self.assertEqual(panel.syntax().scope, "text.telescope")
+        self.assertEqual(
+            panel.substr(sublime.Region(0, panel.size())),
+            "current.py:2",
+        )
+        self.assertEqual(panel.folded_regions(), [])
+        yield from self._confirm()
         yield lambda: self.window.active_view().file_name() == current
 
         self.assertEqual(self.window.active_view().file_name(), current)
+        # The cursor is at the start of the match
+        match_point = self.window.active_view().text_point(1, len("xxx "))
         self.assertEqual(
             [region.to_tuple() for region in self.window.active_view().sel()],
-            [(4, 4)],
+            [(match_point, match_point)],
         )
 
     def test_current_file_search_is_restored_and_selected_on_next_run(self):
@@ -103,13 +190,13 @@ class TestTelescope(DeferrableTestCase):
         yield from self._open_file(current)
 
         self.window.run_command("telescope", {"current_file": True})
-        yield from self._replace_input("restore_unique_query")
+        yield from self._replace_search_input("restore_unique_query")
         yield from self._wait_for_preview(current)
-        yield from self._press_enter()
+        yield from self._confirm()
         yield lambda: self.window.active_view().file_name() == current
 
         self.window.run_command("telescope", {"current_file": True})
-        input_view = yield from self._wait_for_input()
+        input_view = yield from self._wait_for_search_input_text("restore_unique_query")
 
         self.assertEqual(self._input_text(input_view), "restore_unique_query")
         self.assertEqual(
@@ -125,16 +212,76 @@ class TestTelescope(DeferrableTestCase):
         yield from self._open_file(current)
 
         self.window.run_command("telescope", {"current_file": True})
-        yield from self._replace_input("restore_glob_query")
+        yield from self._replace_search_input("restore_glob_query")
         yield from self._wait_for_preview(current)
-        yield from self._press_enter()
+        yield from self._confirm()
         yield lambda: self.window.active_view().file_name() == current
 
         self.window.run_command("telescope", {"globs": "*"})
-        input_view = yield from self._wait_for_input_text("restore_glob_query")
+        input_view = yield from self._wait_for_search_input_text("restore_glob_query")
 
         # should have restored the search we did in the "current file mode"
         self.assertEqual(self._input_text(input_view), "restore_glob_query")
+
+    def test_up_down_moves_the_highlight_without_wrapping(self):
+        current = _write(
+            os.path.join(self.project_dir, "navigate.py"),
+            "navigate_needle one\nnavigate_needle two\n",
+        )
+        view = yield from self._open_file(current)
+
+        self.window.run_command("telescope", {"current_file": True})
+        yield from self._replace_search_input("navigate_needle")
+        yield from self._wait_for_preview(current)
+        self.assertEqual(self._highlighted_row(), 0)
+
+        self.window.run_command("telescope_move", {"forward": True})
+        yield 50
+        self.assertEqual(self._highlighted_row(), 1)
+        # the preview follows the highlight, selecting the match
+        self.assertEqual(view.sel()[0].begin(), view.text_point(1, 0))
+
+        self.window.run_command("telescope_move", {"forward": True})
+        yield 50
+        self.assertEqual(self._highlighted_row(), 1)
+
+        self.window.run_command("telescope_move", {"forward": False})
+        yield 50
+        self.assertEqual(self._highlighted_row(), 0)
+
+        self.window.run_command("telescope_move", {"forward": False})
+        yield 50
+        self.assertEqual(self._highlighted_row(), 0)
+
+    def test_highlight_index_is_restored_on_next_run(self):
+        current = _write(
+            os.path.join(self.project_dir, "restore_index.py"),
+            "restore_index_query one\nrestore_index_query two\n",
+        )
+        yield from self._open_file(current)
+
+        self.window.run_command("telescope", {"current_file": True})
+        yield from self._replace_search_input("restore_index_query")
+        yield from self._wait_for_preview(current)
+        self.window.run_command("telescope_move", {"forward": True})
+        yield 100
+        self.assertEqual(self._highlighted_row(), 1)
+
+        self.window.run_command("telescope_cancel")
+        yield 100
+
+        self.window.run_command("telescope", {"current_file": True})
+        yield from self._wait_for_search_input_text("restore_index_query")
+        yield from self._wait_for_preview(current)
+        self.assertEqual(self._highlighted_row(), 1)
+
+        yield from self._confirm()
+        yield lambda: self.window.active_view().file_name() == current
+
+        self.window.run_command("telescope", {"current_file": True})
+        yield from self._wait_for_search_input_text("restore_index_query")
+        yield from self._wait_for_preview(current)
+        self.assertEqual(self._highlighted_row(), 1)
 
     def test_selected_text_fills_current_file_search(self):
         current = _write(
@@ -149,7 +296,7 @@ class TestTelescope(DeferrableTestCase):
         yield 25
 
         self.window.run_command("telescope", {"current_file": True})
-        input_view = yield from self._wait_for_input_text("selected_query_text")
+        input_view = yield from self._wait_for_search_input_text("selected_query_text")
 
         self.assertEqual(self._input_text(input_view), "selected_query_text")
         self.assertEqual(
@@ -172,9 +319,13 @@ class TestTelescope(DeferrableTestCase):
         yield 25
 
         self.window.run_command("telescope")
-        yield from self._replace_input("*")
+        # As bound to shift+escape in the search input
+        self.window.run_command("telescope_set_globs")
+        yield from self._replace_glob_input("*")
         yield from self._press_enter()
-        input_view = yield from self._wait_for_input_text("selected_glob_query_text")
+        input_view = yield from self._wait_for_search_input_text(
+            "selected_glob_query_text"
+        )
 
         self.assertEqual(self._input_text(input_view), "selected_glob_query_text")
         self.assertEqual(
@@ -200,17 +351,17 @@ class TestTelescope(DeferrableTestCase):
         yield 25
 
         self.window.run_command("telescope", {"current_file": True})
-        yield from self._replace_input("needle_escape_scroll")
+        yield from self._replace_search_input("needle_escape_scroll")
         yield from self._wait_for_preview(current)
-        self.assertTrue(view.get_regions("telescope-result-view"))
+        # The match is selected in the preview
+        self.assertEqual(view.sel()[0].begin(), view.text_point(80, 0))
 
-        self.window.run_command("hide_overlay")
+        self.window.run_command("telescope_cancel")
         yield 100
 
         self.assertEqual(self.window.active_view(), view)
         self.assertEqual([region.to_tuple() for region in view.sel()], [(10, 10)])
         self.assertEqual(view.viewport_position(), (0, 350))
-        self.assertEqual(view.get_regions("telescope-result-view"), [])
 
     def _open_file(self, path: str):
         view = self.window.open_file(path)
@@ -220,36 +371,54 @@ class TestTelescope(DeferrableTestCase):
         yield 25
         return view
 
-    def _replace_input(self, text: str):
-        input_view = yield from self._wait_for_input()
+    def _replace_glob_input(self, text: str):
+        input_view = yield from self._wait_for_glob_input()
         input_view.sel().clear()
         input_view.sel().add(sublime.Region(0, input_view.size()))
         input_view.run_command("insert", {"characters": text})
-        yield 750
+        yield 150
+        return input_view
+
+    def _replace_search_input(self, text: str):
+        input_view = yield from self._wait_for_search_input()
+        input_view.run_command("select_all")
+        input_view.run_command("insert", {"characters": text})
+        yield 750  # wait for the debounced live search
         return input_view
 
     def _press_enter(self):
         self.window.run_command("select")
         yield 150
 
-    def _wait_for_input(self):
-        yield lambda: self._command_input_view() is not None
-        return self._command_input_view()
+    def _confirm(self):
+        self.window.run_command("telescope_confirm")
+        yield 150
 
-    def _wait_for_input_text(self, text: str):
-        yield lambda: (
-            self._command_input_view() is not None
-            and self._input_text(self._command_input_view()) == text
+    def _wait_for_glob_input(self):
+        yield lambda: self._glob_input_view() is not None
+        return self._glob_input_view()
+
+    def _wait_for_search_input(self):
+        yield lambda: self._search_input_view() is not None
+        return self._search_input_view()
+
+    def _wait_for_search_input_text(self, text: str):
+        yield (
+            lambda: (
+                self._search_input_view() is not None
+                and self._input_text(self._search_input_view()) == text
+            )
         )
-        return self._command_input_view()
+        return self._search_input_view()
 
     def _wait_for_preview(self, file_name: str):
         yield lambda: self._view_for_file(file_name) is not None
         view = self._view_for_file(file_name)
+        # The preview highlights the fuzzy matched text
         yield lambda: view.get_regions("telescope-result-view")
         return view
 
-    def _command_input_view(self):
+    def _glob_input_view(self):
         for buffer in sublime._buffers():
             view = buffer.primary_view()
             if (
@@ -259,6 +428,23 @@ class TestTelescope(DeferrableTestCase):
             ):
                 return view
         return None
+
+    def _search_input_view(self):
+        for buffer in sublime._buffers():
+            view = buffer.primary_view()
+            if (
+                view
+                and view.is_valid()
+                and view.window() == self.window
+                and view.settings().get("telescope_input")
+            ):
+                return view
+        return None
+
+    def _highlighted_row(self):
+        panel = self.window.find_output_panel("telescope")
+        region = panel.get_regions("telescope-selected")[0]
+        return panel.rowcol(region.begin())[0]
 
     def _view_for_file(self, file_name: str):
         for view in self.window.views(include_transient=True):

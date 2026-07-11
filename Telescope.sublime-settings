@@ -1,0 +1,16 @@
+{
+    // Maximum number of results shown in the panel
+    "max_results": 5000,
+    // Delay before searching while typing, in seconds
+    "debounce": 0.3,
+    // Minimum number of characters before searching
+    "min_query_length": 3,
+    // Skip files larger than this (ripgrep --max-filesize)
+    "max_filesize": "100M",
+    // Extra arguments passed to ripgrep
+    "rg_args": [],
+    // Scope coloring the highlighted result in the panel
+    "highlight_scope": "comment | region.yellowish",
+    // Print the executed commands in the console
+    "debug": false,
+}

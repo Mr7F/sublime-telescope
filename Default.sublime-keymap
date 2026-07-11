@@ -1,4 +1,34 @@
 [
+    {
+        "keys": ["up"],
+        "command": "telescope_move",
+        "args": {"forward": false},
+        "context": [
+            {"key": "setting.telescope_input", "operator": "equal", "operand": true}
+        ]
+    },
+    {
+        "keys": ["down"],
+        "command": "telescope_move",
+        "args": {"forward": true},
+        "context": [
+            {"key": "setting.telescope_input", "operator": "equal", "operand": true}
+        ]
+    },
+    {
+        "keys": ["escape"],
+        "command": "telescope_cancel",
+        "context": [
+            {"key": "setting.telescope_input", "operator": "equal", "operand": true}
+        ]
+    },
+    {
+        "keys": ["shift+escape"],
+        "command": "telescope_set_globs",
+        "context": [
+            {"key": "setting.telescope_input", "operator": "equal", "operand": true}
+        ]
+    },
     // {
     //     "keys": [
     //         "ctrl+i"

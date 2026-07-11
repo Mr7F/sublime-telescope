@@ -1,25 +1,23 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
+import os
 import sublime
 from sublime import View, Window
 import re
+import shutil
 import sublime_plugin
+import threading
 import time
 import sys
 import subprocess
 
-
-# LSP "Go to symbols" has a similar feature
-# Hope this issue is fixed one day...
-# > https://github.com/sublimehq/sublime_text/issues/4796
-from .utils import DynamicListInputHandler
+from .utils import debounced
 
 
-SearchContext = tuple[Any, ...]
-RgResult = tuple[str, str, str]
+PANEL_NAME = "telescope"
 
 
 @dataclass
@@ -28,94 +26,135 @@ class SearchResult:
     line_number: int
     # Position of the match in the line
     line_position: tuple[int, int]
-    # Region in the IO panel
     line_content: str
-
-
-@dataclass
-class WindowState:
-    """State of the window before executing the command.
-
-    Allows restoring the state when canceling the search.
-    """
-    active_view: View | None
-    view_sel: dict[View, list[sublime.Region]]
-    view_viewport: dict[View, tuple[float, float]]
 
 
 @dataclass
 class SearchState:
     globs: str = ""
-    highlight_index: int = -1
+    current_file: bool = False
     text: str = ""
-    context: SearchContext | None = None
+    highlight_index: int = 0
+    results: list[SearchResult] = field(default_factory=list)
+    # The io panel views and input listener, set while the search is open
+    output_view: View | None = None
+    input_view: View | None = None
+    listener: InputListener | None = None
+    # The view opened to preview the highlighted result
+    preview: View | None = None
+    # Result waiting for the preview file to finish loading
+    loading_preview: SearchResult | None = None
+    # Processes of the search in progress
+    processes: tuple[subprocess.Popen, ...] = ()
+    # State of the window before the search, restored when canceling
+    active_view: View | None = None
+    view_states: dict[View, tuple[list[sublime.Region], tuple[float, float]]] = field(
+        default_factory=dict
+    )
 
-
-regions_to_add: dict[Window, tuple[View, list[SearchResult], int]] = {}
-window_state: dict[Window, WindowState] = {}
-preview_panels: dict[Window, View] = {}
 
 search_state: defaultdict[Window, SearchState] = defaultdict(SearchState)
-select_search_text_on_open: defaultdict[Window, bool] = defaultdict(bool)
-
-search_results: list[SearchResult] = []
 
 
 class TelescopeCommand(sublime_plugin.WindowCommand):
-    """Executed on the output panel, set the result in the view."""
+    """Open the search io panel."""
 
-    def run(self, result: str, globs: str = "", current_file: bool = False):
-        for view in self.window.views(include_transient=True):
-            view.erase_regions("telescope-result-view")
-        s = search_results[int(result.split(":", 1)[0])]
-        # TODO: keep transient view if possible
-        self.window.open_file(s.path, flags=sublime.SEMI_TRANSIENT)
+    def run(self, globs: str | None = None, current_file: bool = False):
+        window = self.window
+        _save_window_state(window)
+        _set_search_text_from_selection(window)
 
-    def input(self, args: dict[str, Any]) -> sublime_plugin.InputHandler:
-        # Always set the input to see the breadcrumb item
-        # when reloading the command input with the hack in `utils.py`
-        if "result" not in args and "globs" not in args:
-            _save_window_state(self.window)
-            _set_search_text_from_selection(self.window)
-            select_search_text_on_open[self.window] = True
-        if "globs" in args and "result" not in args:
-            return TelescopeListInputHandler(self, args)
-        if args.get("current_file") and "result" not in args:
-            search_args = dict(args)
-            search_args.setdefault("globs", "")
-            return TelescopeListInputHandler(self, search_args)
-        return GlobsInputHandler(self, search_state[self.window].globs)
+        state = search_state[window]
+        if globs is not None:
+            normalized_globs = _normalize_globs(globs)
+            if normalized_globs != state.globs:
+                state.highlight_index = 0
+            state.globs = normalized_globs
+        state.current_file = current_file
+
+        _close_panel(window)
+        output_view, input_view = window.create_io_panel(
+            PANEL_NAME,
+            lambda text: window.run_command("telescope_confirm"),
+        )
+        output_view.set_read_only(True)
+        output_view.settings().set("gutter", False)
+        output_view.settings().set("word_wrap", False)
+        output_view.assign_syntax("scope:text.telescope")
+        input_view.settings().set("telescope_input", True)
+        state.output_view = output_view
+        state.input_view = input_view
+
+        window.run_command("show_panel", {"panel": "output." + PANEL_NAME})
+        window.focus_view(input_view)
+
+        missing_tools = [tool for tool in ("rg", "fzf") if not shutil.which(tool)]
+        if missing_tools:
+            _set_panel_text(
+                output_view,
+                "Missing dependencies: {} (see the readme to install them)".format(
+                    ", ".join(missing_tools)
+                ),
+            )
+            return
+
+        if state.text:
+            # Restore the previous search, but select the text
+            input_view.run_command("select_all")
+            input_view.run_command("insert", {"characters": state.text})
+            input_view.run_command("select_all")
+
+        # Attach after setting the text to only search once, below
+        state.listener = InputListener(window)
+        state.listener.attach(input_view.buffer())
+
+        if state.text:
+            _search(window, state.text)
+
+    def input(self, args: dict[str, Any]) -> sublime_plugin.InputHandler | None:
+        return None
+
+
+class TelescopeSetGlobsCommand(sublime_plugin.WindowCommand):
+    """Ask for globs while the project search input panel is open."""
+
+    def run(self, globs: str | None = None):
+        print("telescope_set_globs")
+        state = search_state[self.window]
+        if not state.input_view or state.current_file:
+            return
+
+        if globs is None:
+            self.window.run_command(
+                "show_overlay",
+                {
+                    "overlay": "command_palette",
+                    "command": "telescope_set_globs",
+                },
+            )
+            return
+
+        normalized_globs = _normalize_globs(globs)
+        if normalized_globs != state.globs:
+            state.highlight_index = 0
+        state.globs = normalized_globs
+        self.window.focus_view(state.input_view)
+        _search(self.window, state.text)
+
+    def input(self, args: dict[str, Any]) -> sublime_plugin.InputHandler | None:
+        state = search_state[self.window]
+        if "globs" in args or not state.input_view or state.current_file:
+            return None
+        return GlobsInputHandler(state.globs)
+
+    def is_enabled(self) -> bool:
+        state = search_state[self.window]
+        return bool(state.input_view and not state.current_file)
 
 
 class GlobsInputHandler(sublime_plugin.TextInputHandler):
-    def __init__(
-        self,
-        window_command: TelescopeCommand,
-        initial_value: str | None,
-    ):
-        self.window = window_command.window
-        self.window_command = window_command
-        self._initial_value = initial_value or ""
-
-    def validate(self, text: str) -> bool:
-        return not text or bool((text or "").strip())
-
-    def description(self, value: str | None) -> str | None:
-        if not value and value is not None:
-            return "All"
-        return value
-
-    def initial_text(self) -> str:
-        if self._initial_value is not None:
-            sublime.set_timeout(self._select_and_reset)
-        return self._initial_value
-
-    def _select_and_reset(self):
-        # See: https://github.com/sublimehq/sublime_text/issues/5507
-        # Taken from the "LSP Go to symbols" and adapted for Text input
-        self._initial_value = None
-        if self.window.is_valid():
-            self.window.run_command("select")
+    def __init__(self, initial_value: str):
+        self._initial_value = initial_value
 
     def name(self) -> str:
         return "globs"
@@ -123,151 +162,271 @@ class GlobsInputHandler(sublime_plugin.TextInputHandler):
     def placeholder(self) -> str:
         return ".py, .js, views/*.html"
 
-    def cancel(self):
-        _reset_window_state(self.window, close_preview=True)
-
-    def next_input(
-        self,
-        args: dict[str, Any],
-    ) -> TelescopeListInputHandler | None:
-        search_state[self.window].globs = ", ".join(
-            g.strip() for g in args[self.name()].split(",")
-        )
-        if "result" not in args:
-            return TelescopeListInputHandler(self.window_command, args)
-
-
-class TelescopeListInputHandler(DynamicListInputHandler):
-    def __init__(self, window_command: TelescopeCommand, args: dict[str, Any]):
-        global search_results
-        super().__init__(window_command, args)
-        self.window = window_command.window
-        self.window_command = window_command
-        self.search_state = search_state[self.window]
-        self.search_context = _get_search_context(self.window, args)
-        same_search = self.search_state.context == self.search_context
-        self.search_results = list(search_results) if same_search else []
-
-        if not self.search_state.text:
-            return
-
-        self.text = self.search_state.text
-        if not same_search:
-            self.search_state.highlight_index = -1
-            self.search_results = _live_search(
-                self.window_command.window,
-                self.text,
-                self.args["globs"],
-                self.args.get("current_file", False),
-            )
-            search_results = self.search_results
-            self.search_state.context = self.search_context
-
-        setattr(self.command, "_text", self.text)
-        setattr(self.command, "_items", self._list_items(self.search_results))
-
-    def name(self) -> str:
-        return "result"
-
-    def placeholder(self) -> str:
-        return "Fuzzy find"
-
-    def cancel(self):
-        super().cancel()
-        for view in self.window_command.window.views(include_transient=True):
-            view.erase_regions("telescope-result-view")
-
-        _reset_window_state(self.window_command.window, close_preview=True)
-
     def validate(self, text: str) -> bool:
-        return bool((text or "").strip())
+        return not text or bool(text.strip())
+
+    def description(self, value: str) -> str:
+        return value or "All"
+
+    def initial_text(self) -> str:
+        return self._initial_value
 
     def initial_selection(self) -> list[tuple[int, int]]:
-        if select_search_text_on_open[self.window]:
-            # if we search, then press enter, then press the shortcut again
-            # keep the old search in the search bar, but select it
-            select_search_text_on_open[self.window] = False
-            if self.text:
-                return [(0, len(self.text))]
-        if hasattr(self.command, "_selection"):
-            return self.command._selection
-        return super().initial_selection()
+        return [(0, len(self._initial_value))]
 
-    def preview(self, text: str):
-        """Save the current highlighted index and show the preview.
 
-        Save the highlighted element, so we can re-open the view
-        at the same position.
-        """
-        if (text or "").strip():
-            self.search_state.highlight_index = int(text.split(":", 1)[0])
-            _preview_result(
-                self.window_command.window,
-                self.search_results,
-                self.search_state.highlight_index,
-            )
+class TelescopeMoveCommand(sublime_plugin.WindowCommand):
+    """Move the highlighted result, bound to up/down in the io panel input."""
 
-    def on_modified(self, text: str):
-        global search_results
-        self.search_state.highlight_index = -1
-        self.search_state.text = text
-
-        search_results = _live_search(
-            self.window_command.window,
-            text,
-            self.args["globs"],
-            self.args.get("current_file", False),
+    def run(self, forward: bool):
+        state = search_state[self.window]
+        if not state.results:
+            return
+        step = 1 if forward else -1
+        state.highlight_index = max(
+            0, min(state.highlight_index + step, len(state.results) - 1)
         )
-        self.search_results = list(search_results)
-        self.search_state.context = self.search_context
+        _highlight_result_in_output_panel(self.window)
 
-        setattr(
-            self.command,
-            "_selection",
-            [s.to_tuple() for s in self.input_view.sel()],
+
+class TelescopeConfirmCommand(sublime_plugin.WindowCommand):
+    """Open the highlighted result, executed when pressing enter."""
+
+    def run(self):
+        state = search_state[self.window]
+        if not state.results:
+            return
+        _erase_result_regions(self.window)
+        result = state.results[state.highlight_index]
+        _close_panel(self.window)
+        # TODO: keep transient view if possible
+        self.window.open_file(
+            _encoded_position(result),
+            flags=sublime.SEMI_TRANSIENT | sublime.ENCODED_POSITION,
         )
-        self.update(self._list_items(search_results))
-
-    def get_list_items(self) -> Any:
-        return self._list_items(self.search_results)
-
-    def _list_items(
-        self,
-        search_results: list[SearchResult],
-    ) -> Any:
-        if not search_results:
-            return []
-
-        return [
-            sublime.ListInputItem(
-                text=_fixed_size(s.line_content.strip(), 100),
-                details=_fixed_size(
-                    f"{s.path}:{s.line_number}:{s.line_position[0]}", 100
-                ),
-                # TODO: remove that hack (otherwise it's closed by the fuzzy search of sublime)
-                value=str(i) + ":" + s.line_content.strip(),
-                annotation="",
-            )
-            for i, s in enumerate(search_results)
-        ], self.search_state.highlight_index
 
 
-class IoPanelEventListener(sublime_plugin.EventListener):
+class TelescopeCancelCommand(sublime_plugin.WindowCommand):
+    """Close the search and restore the window state, bound to escape."""
+
+    def run(self):
+        _erase_result_regions(self.window)
+        _close_panel(self.window)
+        _reset_window_state(self.window)
+
+
+class InputListener(sublime_plugin.TextChangeListener):
+    """Live search while typing in the io panel input."""
+
+    def __init__(self, window: Window):
+        super().__init__()
+        self.window = window
+
+    @classmethod
+    def is_applicable(cls, buffer: sublime.Buffer) -> bool:
+        # Only attached manually on the io panel input
+        return False
+
+    @debounced
+    def on_text_changed(self, changes: list[sublime.TextChange]):
+        if not self.is_attached():
+            return
+        view = self.buffer.primary_view()
+        _search(self.window, view.substr(sublime.Region(0, view.size())))
+
+
+class TelescopeEventListener(sublime_plugin.EventListener):
     def on_load(self, view: View):
-        window = view.window()
-        if window in regions_to_add and view == regions_to_add[window][0]:
-            _set_file_view_regions(*regions_to_add[window])
-            del regions_to_add[window]
+        state = search_state[view.window()]
+        if view == state.preview and state.loading_preview:
+            _add_result_region(view, state.loading_preview)
+            state.loading_preview = None
+
+    def on_pre_close_window(self, window: Window):
+        search_state.pop(window, None)
+
+
+def _search(window: Window, text: str):
+    state = search_state[window]
+    if text != state.text:
+        # New search, restart from the first result
+        state.highlight_index = 0
+    state.text = text
+    _kill_search(window)
+    # Search in the background, it can lag on big projects
+    threading.Thread(
+        target=_search_in_background, args=(window, text), daemon=True
+    ).start()
+
+
+def _search_in_background(window: Window, text: str):
+    start = time.time()
+    results = _live_search(window, text)
+
+    def show_results():
+        state = search_state[window]
+        if text != state.text or not state.output_view:
+            # The search changed or was closed in the meantime
+            return
+        state.results = results
+        state.highlight_index = min(state.highlight_index, max(len(results) - 1, 0))
+        _render_results(window)
+        if len(text) >= _settings().get("min_query_length", 3):
+            window.status_message(
+                "Telescope: {} results in {:.2f}s".format(
+                    len(results), time.time() - start
+                )
+            )
+
+    sublime.set_timeout(show_results)
+
+
+def _render_results(window: Window):
+    state = search_state[window]
+    _set_panel_text(
+        state.output_view,
+        "\n".join(
+            f"{_relative_path(window, s.path)}:{s.line_number}: {s.line_content}"
+            for s in state.results
+        ),
+    )
+    _highlight_result_in_output_panel(window)
+
+
+def _set_panel_text(view: View, text: str):
+    view.set_read_only(False)
+    view.run_command("select_all")
+    view.run_command("right_delete")
+    view.run_command("append", {"characters": text})
+    view.set_read_only(True)
+
+
+def _highlight_result_in_output_panel(window: Window):
+    state = search_state[window]
+    view = state.output_view
+
+    if not state.results:
+        view.erase_regions("telescope-selected")
+        return
+
+    line = view.line(view.text_point(state.highlight_index, 0))
+    view.add_regions(
+        "telescope-selected",
+        [line],
+        icon="",
+        scope="comment | region.yellowish",
+    )
+    # Defer, the panel is not laid out yet when it just opened
+    sublime.set_timeout(lambda: _center_highlight(view, line))
+    _preview_result(window, state.results[state.highlight_index])
+    # The preview steals the focus when it opens a new file
+    window.focus_view(state.input_view)
+
+
+def _center_highlight(view: View, line: sublime.Region):
+    """Center the highlighted line, scrolling by whole lines.
+
+    `show` and `show_at_center` can leave the line half visible on the
+    edges, especially when the panel is not laid out yet.
+    """
+    line_height = view.line_height()
+    half_screen = view.viewport_extent()[1] // (2 * line_height) * line_height
+    top = view.text_to_layout(line.begin())[1]
+    view.set_viewport_position((0, max(0.0, top - half_screen)), animate=False)
+
+
+def _preview_result(window: Window, result: SearchResult):
+    """Preview the file in a tab while navigating the result."""
+    state = search_state[window]
+    # Transient: sublime keeps a single preview per group and replaces
+    # it automatically when previewing an other file. The encoded
+    # position moves the cursor, even if the file is still loading
+    state.preview = window.open_file(
+        _encoded_position(result),
+        flags=sublime.TRANSIENT | sublime.ENCODED_POSITION,
+    )
+    if state.preview.is_loading():
+        state.loading_preview = result
+    else:
+        _add_result_region(state.preview, result)
+
+
+def _encoded_position(result: SearchResult) -> str:
+    return "{}:{}:{}".format(
+        result.path, result.line_number, result.line_position[0] + 1
+    )
+
+
+def _add_result_region(view: View, result: SearchResult):
+    """Highlight the result in the preview file we opened."""
+    line_a = view.text_point(result.line_number - 1, result.line_position[0])
+    view.add_regions(
+        "telescope-result-view",
+        [
+            sublime.Region(
+                line_a,
+                line_a - result.line_position[0] + result.line_position[1],
+            )
+        ],
+        icon="",
+        scope="comment | region.yellowish",
+    )
+
+
+def _erase_result_regions(window: Window):
+    for view in window.views(include_transient=True):
+        view.erase_regions("telescope-result-view")
+
+
+def _close_panel(window: Window):
+    state = search_state[window]
+    _kill_search(window)
+    if state.listener and state.listener.is_attached():
+        state.listener.detach()
+    if state.output_view:
+        window.destroy_output_panel(PANEL_NAME)
+    state.output_view = state.input_view = state.listener = None
+
+
+def _normalize_globs(globs: str) -> str:
+    return ", ".join(g.strip() for g in globs.split(","))
+
+
+def _close_preview(window: Window):
+    state = search_state[window]
+    preview = state.preview
+    state.preview = None
+    state.loading_preview = None
+    if not preview or not preview.is_valid() or preview == state.active_view:
+        return
+
+    sheet = preview.sheet()
+    if sheet and (sheet.is_transient() or sheet.is_semi_transient()):
+        sheet.close()
 
 
 def _save_window_state(window: Window):
-    views = window.views()
+    state = search_state[window]
+    state.active_view = window.active_view()
+    state.view_states = {
+        view: (list(view.sel()), view.viewport_position()) for view in window.views()
+    }
 
-    window_state[window] = WindowState(
-        active_view=window.active_view(),
-        view_sel={view: list(view.sel()) for view in views},
-        view_viewport={view: view.viewport_position() for view in views},
-    )
+
+def _reset_window_state(window: Window):
+    """Reset the initial state (cursor position, file opened, scroll position, etc.)."""
+    state = search_state[window]
+    if state.active_view:
+        window.focus_view(state.active_view)
+
+    _close_preview(window)
+
+    for view, (sel, viewport_position) in state.view_states.items():
+        if not view.is_valid():
+            continue
+        view.sel().clear()
+        view.sel().add_all(sel)
+        view.set_viewport_position(viewport_position, animate=False)
 
 
 def _set_search_text_from_selection(window: Window):
@@ -276,116 +435,55 @@ def _set_search_text_from_selection(window: Window):
         return
 
     for region in view.sel():
-        if region.empty():
-            continue
-
         selected_text = view.substr(region).strip()
         if selected_text:
             search_state[window].text = selected_text
-            search_state[window].context = None
             return
 
 
-def _reset_window_state(
-    window: Window,
-    focus_old_view: bool = True,
-    close_preview: bool = False,
-):
-    """Reset the initial state (cursor position, file opened, scroll position, etc.)."""
-    state = window_state.get(window)
-    if not state:
-        return
-
-    if state.active_view and focus_old_view:
-        window.focus_view(state.active_view)
-
-    if close_preview:
-        _close_preview_panel(window)
-
-    for view, sel in state.view_sel.items():
-        if not view.is_valid():
-            continue
-        view.sel().clear()
-        view.sel().add_all(sel)
-
-    for view, viewport_position in state.view_viewport.items():
-        if view.is_valid():
-            view.set_viewport_position(viewport_position, animate=False)
-
-
-def _close_preview_panel(window: Window):
-    preview_panel = preview_panels.get(window)
-    if not preview_panel or not preview_panel.is_valid():
-        return
-
-    state = window_state.get(window)
-    if state and preview_panel == state.active_view:
-        return
-
-    sheet = preview_panel.sheet()
-    if not sheet:
-        return
-
-    is_transient = getattr(sheet, "is_transient", None)
-    is_semi_transient = getattr(sheet, "is_semi_transient", None)
-    if (
-        callable(is_transient)
-        and is_transient()
-        or callable(is_semi_transient)
-        and is_semi_transient()
-    ):
-        sheet.close()
-        preview_panels.pop(window, None)
-
-
-def _live_search(
-    window: Window,
-    search_query: str,
-    globs: str,
-    current_file: bool = False,
-) -> list[SearchResult]:
-    global search_results
-    if len(search_query) < 3:
+def _live_search(window: Window, search_query: str) -> list[SearchResult]:
+    settings = _settings()
+    if len(search_query) < settings.get("min_query_length", 3):
         return []
-
-    start = time.time()
 
     rg_cmd = [
         "rg",
         "--no-heading",
         "--max-filesize",
-        "100M",
+        str(settings.get("max_filesize", "100M")),
         "--max-count",
         "10000",
         "--follow",
         "--with-filename",
         "--line-number",
         "--smart-case",
+        *settings.get("rg_args", []),
         "-e",
-        ".*" + ".*".join(map(re.escape, search_query)) + ".*",
+        ".*".join(map(re.escape, search_query)),
     ]
 
-    state = _get_window_state(window)
-    view = state.active_view if state else window.active_view()
-    if view and not current_file:
-        # The `--iglob` when is negated is done in addition to the
-        # default filter (.gitignore, etc)
-        exclude_patterns = view.settings().get("binary_file_patterns") or []
-        exclude_patterns += view.settings().get("file_exclude_patterns") or []
-        exclude_patterns += [
-            f"**/{f}**/" for f in view.settings().get("folder_exclude_patterns") or []
-        ]
-        for glob in exclude_patterns:
-            glob = re.sub(r"\*+", "**", glob)
-            rg_cmd.extend(("--iglob", f"!**/*{glob}"))
+    state = search_state[window]
+    view = state.active_view or window.active_view()
 
-    if current_file:
-        current_file_name = _get_current_file_name(window)
-        if not current_file_name:
+    if state.current_file:
+        if not view or not view.file_name():
             return []
-        rg_cmd.append(current_file_name)
+        rg_cmd.append(view.file_name())
     else:
-        for glob in globs.split(","):
+        if view:
+            # The `--iglob` when is negated is done in addition to the
+            # default filter (.gitignore, etc)
+            exclude_patterns = view.settings().get("binary_file_patterns") or []
+            exclude_patterns += view.settings().get("file_exclude_patterns") or []
+            exclude_patterns += [
+                f"**/{f}**/"
+                for f in view.settings().get("folder_exclude_patterns") or []
+            ]
+            for glob in exclude_patterns:
+                glob = re.sub(r"\*+", "**", glob)
+                rg_cmd.extend(("--iglob", f"!**/*{glob}"))
+
+        for glob in state.globs.split(","):
             glob = glob.strip()
             if not glob:
                 continue
@@ -396,7 +494,8 @@ def _live_search(
 
         rg_cmd += window.folders()
 
-    print(" ".join(rg_cmd))
+    if settings.get("debug"):
+        print(" ".join(rg_cmd))
 
     rg_process = _create_process(rg_cmd)
     fzf_process = _create_process(
@@ -404,8 +503,9 @@ def _live_search(
         stdin=rg_process.stdout,
     )
     rg_process.stdout.close()
-    search_results = []
-    for _ in range(50):  # Read first X lines
+    state.processes = (rg_process, fzf_process)
+    results = []
+    for _ in range(settings.get("max_results", 50)):
         line = fzf_process.stdout.readline().strip()
         if not line:
             break
@@ -414,7 +514,7 @@ def _live_search(
         to_trim = next((i for i, s in enumerate(content) if s.strip()), 0)
         content = content.strip()
 
-        search_results.append(
+        results.append(
             SearchResult(
                 path,
                 int(line_number),
@@ -426,100 +526,32 @@ def _live_search(
     rg_process.terminate()
     fzf_process.terminate()
 
-    print("Search done in", time.time() - start)
-
-    return search_results
+    return results
 
 
-def _preview_result(
-    window: Window,
-    search_results: list[SearchResult],
-    result_index: int,
-):
-    if not search_results:
-        return
-
-    if (
-        window not in preview_panels
-        or preview_panels[window].file_name() != search_results[result_index].path
-        or not preview_panels[window].sheet()
-        or not preview_panels[window].sheet().is_selected()
-    ):
-        preview_panels[window] = window.open_file(
-            search_results[result_index].path,
-            flags=sublime.TRANSIENT,
-        )
-
-    _set_file_view_regions(preview_panels[window], search_results, result_index)
+def _kill_search(window: Window):
+    for process in search_state[window].processes:
+        process.terminate()
 
 
-def _set_file_view_regions(
-    view: View,
-    search_results: list[SearchResult],
-    result_index: int,
-):
-    """Set the region in the preview file we opened."""
-    if view.is_loading():
-        # Need to wait
-        regions_to_add[view.window()] = (view, search_results, result_index)
-        return
-
-    search_result = search_results[result_index]
-    line_a = view.text_point(
-        search_result.line_number - 1,
-        search_result.line_position[0],
-    )
-    r_view = sublime.Region(
-        line_a,
-        line_a - search_result.line_position[0] + search_result.line_position[1],
-    )
-
-    view.sel().clear()
-    view.sel().add(sublime.Region(line_a, line_a))
-
-    view.show(r_view, animate=False)
-    view.add_regions(
-        "telescope-result-view",
-        [r_view],
-        icon="",
-        scope="comment | region.yellowish",
-    )
+def _settings() -> sublime.Settings:
+    return sublime.load_settings("Telescope.sublime-settings")
 
 
-def _fixed_size(s: str | None, size: int) -> str:
-    """Make the string having a fixed size."""
-    s = s or ""
-    s = s[:size]
-    s += " " * (size - len(s))
-    return s
+def _relative_path(window: Window, path: str) -> str:
+    """Convert the absolute path returned by the CLI tools to relative based on the current folders."""
+    for folder in window.folders():
+        if path.startswith(folder + os.sep):
+            return path[len(folder) + 1 :]
+    return path
 
 
-def _get_window_state(window: Window) -> WindowState | None:
-    return window_state.get(window)
-
-
-def _get_current_file_name(window: Window) -> str | None:
-    state = _get_window_state(window)
-    view = state.active_view if state else window.active_view()
-    if not view:
-        return None
-    return view.file_name()
-
-
-def _get_search_context(window: Window, args: dict[str, Any]) -> SearchContext:
-    return (
-        ("current_file", _get_current_file_name(window))
-        if args.get("current_file")
-        else ("folders", tuple(window.folders()), args.get("globs", ""))
-    )
-
-
-def _parse_rg_result(result: str) -> RgResult:
+def _parse_rg_result(result: str) -> tuple[str, str, str]:
     if sys.platform.startswith("win"):
         drive, path, line_number, content = result.split(":", 3)
         path = drive + ":" + path
         return path, line_number, content
-    return result.split(":", 2)
+    return tuple(result.split(":", 2))
 
 
 def _create_process(
@@ -535,7 +567,8 @@ def _create_process(
     return subprocess.Popen(
         args,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        # Never read, a filling stderr pipe would block the process
+        stderr=subprocess.DEVNULL,
         text=True,
         shell=False,
         **cmd_args,

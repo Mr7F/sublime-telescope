@@ -13,6 +13,14 @@
             "caption": "Telescope",
             "children": [
               {
+                "caption": "Settings",
+                "command": "edit_settings",
+                "args": {
+                  "base_file": "${packages}/sublime-telescope/Telescope.sublime-settings",
+                  "default": "{\n\t$0\n}\n",
+                }
+              },
+              {
                 "caption": "Key Bindings",
                 "command": "edit_settings",
                 "args": {

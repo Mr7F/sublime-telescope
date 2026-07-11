@@ -3,6 +3,15 @@
     //     "keys": [
     //         "ctrl+i"
     //     ],
+    //     "command": "telescope",
+    //     "args": {
+    //         "current_file": true
+    //     }
+    // },
+    // {
+    //     "keys": [
+    //         "ctrl+shift+i"
+    //     ],
     //     "command": "telescope"
     // }
 ]

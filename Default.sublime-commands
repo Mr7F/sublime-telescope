@@ -3,4 +3,11 @@
         "caption": "Telescope",
         "command": "telescope"
     },
+    {
+        "caption": "Telescope: Current File",
+        "command": "telescope",
+        "args": {
+            "current_file": true
+        }
+    },
 ]

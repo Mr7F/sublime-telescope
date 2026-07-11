@@ -41,6 +41,15 @@ Windows with choco
 ```json
 {
     "keys": ["ctrl+i"],
+    "command": "telescope",
+    "args": {"current_file": true}
+}
+```
+
+Search using globs:
+```json
+{
+    "keys": ["ctrl+shift+i"],
     "command": "telescope"
 }
 ```

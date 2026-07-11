@@ -21,6 +21,8 @@ preview_panels = {}
 
 current_globs = defaultdict(str)
 current_highlight_index = defaultdict(lambda: -1)
+current_search_text = defaultdict(str)  # keep the written text to be able to restore it
+select_search_text_on_open = defaultdict(bool)
 
 search_results = ()
 
@@ -52,6 +54,7 @@ class TelescopeCommand(sublime_plugin.WindowCommand):
         # when reloading the command input with the hack in `utils.py`
         if not args:
             _save_initial_state(self.window)
+            select_search_text_on_open[self.window] = True
         return GlobsInputHandler(self, current_globs[self.window])
 
 
@@ -99,11 +102,15 @@ class GlobsInputHandler(sublime_plugin.TextInputHandler):
 
 class TelescopeListInputHandler(DynamicListInputHandler):
     def __init__(self, window_command, args):
-        global search_results
+        global search_results, current_search_text
         super().__init__(window_command, args)
         self.window = window_command.window
         self.window_command = window_command
         self.search_results = list(search_results)
+        if current_search_text[self.window]:
+            self.text = current_search_text[self.window]
+            setattr(self.command, "_text", self.text)
+            setattr(self.command, "_items", self._list_items(self.search_results))
 
     def name(self):
         return "result"
@@ -121,6 +128,12 @@ class TelescopeListInputHandler(DynamicListInputHandler):
         return bool((text or "").strip())
 
     def initial_selection(self):
+        if select_search_text_on_open[self.window]:
+            # if we search, then press enter, then press the shortcut again
+            # keep the old search in the search bar, but select it
+            select_search_text_on_open[self.window] = False
+            if self.text:
+                return [(0, len(self.text))]
         if hasattr(self.command, "_selection"):
             return self.command._selection
         return super().initial_selection()
@@ -141,8 +154,9 @@ class TelescopeListInputHandler(DynamicListInputHandler):
             )
 
     def on_modified(self, text: str) -> None:
-        global search_results, current_highlight_index
+        global search_results, current_highlight_index, current_search_text
         current_highlight_index[self.window] = -1
+        current_search_text[self.window] = text
 
         search_results = _live_search(
             self.window_command.window,

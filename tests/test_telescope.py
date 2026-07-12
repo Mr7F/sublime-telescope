@@ -1,5 +1,6 @@
 import os
 import shutil
+import sys
 import tempfile
 
 import sublime
@@ -20,6 +21,7 @@ class TestTelescope(DeferrableTestCase):
             self.skipTest("missing external tools: {}".format(", ".join(missing_tools)))
 
         self.window = sublime.active_window()
+        self._reset_telescope_state()
         self.project_dir = tempfile.mkdtemp(prefix="sublime-telescope-", dir="/tmp")
         self.previous_project_data = self.window.project_data()
         self.views_to_close = []
@@ -37,6 +39,7 @@ class TestTelescope(DeferrableTestCase):
     def tearDown(self):
         self.window.run_command("hide_overlay")
         self.window.run_command("telescope_cancel")
+        self._reset_telescope_state()
         for view in self.window.views(include_transient=True):
             file_name = view.file_name()
             if file_name and file_name.startswith(self.project_dir) and view.is_valid():
@@ -48,6 +51,20 @@ class TestTelescope(DeferrableTestCase):
 
         self.window.set_project_data(self.previous_project_data or {"folders": []})
         shutil.rmtree(self.project_dir, ignore_errors=True)
+
+    def _reset_telescope_state(self):
+        telescope = self._telescope_module()
+        telescope.search_state[self.window] = telescope.SearchState()
+
+    def _telescope_module(self):
+        telescope_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), os.pardir, "telescope.py")
+        )
+        for module in sys.modules.values():
+            module_path = getattr(module, "__file__", None)
+            if module_path and os.path.abspath(module_path) == telescope_path:
+                return module
+        raise RuntimeError("sublime-telescope plugin module is not loaded")
 
     def test_project_search_uses_globs_and_opens_matching_file(self):
         seed = _write(
@@ -67,7 +84,7 @@ class TestTelescope(DeferrableTestCase):
         self.window.run_command("telescope")
         # As bound to shift+escape in the search input
         self.window.run_command("telescope_set_globs")
-        yield from self._replace_glob_input(".py")
+        yield from self._replace_glob_input("*.py")
         yield from self._press_enter()
         yield from self._replace_search_input("glob_unique_target")
         yield from self._wait_for_preview(target)

@@ -82,31 +82,33 @@ class TelescopeCommand(sublime_plugin.WindowCommand):
 
     def run(self, globs: str | None = None, current_file: bool = False):
         window = self.window
+        state = search_state[window]
+        previous_search = _search_context(state)
+
         _save_window_state(window)
         _set_search_text_from_selection(window)
-
-        state = search_state[window]
         if globs is not None:
             _set_globs(state, globs)
         state.current_file = current_file
 
         _close_panel(window)
-        # The files may have changed since the previous search
-        state.styled_line_cache.clear()
-        state.parser_view_path = None
-        output_view, input_view = window.create_io_panel(
-            PANEL_NAME,
-            on_input=lambda text: window.run_command("telescope_confirm"),
-            unlisted=True,
-        )
+        # Create the panel once per window: `create_io_panel` clears the
+        # content of an existing panel, and `is_valid` is not reliable
+        # for the hidden panel views
+        if not state.output_view:
+            output_view, input_view = window.create_io_panel(
+                PANEL_NAME,
+                on_input=lambda text: window.run_command("telescope_confirm"),
+                unlisted=True,
+            )
+            output_view.set_read_only(True)
+            output_view.settings().set("gutter", False)
+            output_view.settings().set("word_wrap", False)
+            input_view.settings().set("telescope_input", True)
+            state.output_view = output_view
+            state.input_view = input_view
 
-        output_view.set_read_only(True)
-        output_view.settings().set("gutter", False)
-        output_view.settings().set("word_wrap", False)
-        input_view.settings().set("telescope_input", True)
-
-        state.output_view = output_view
-        state.input_view = input_view
+        input_view = state.input_view
         state.is_open = True
         _assign_panel_syntax(window)
 
@@ -115,7 +117,7 @@ class TelescopeCommand(sublime_plugin.WindowCommand):
 
         if missing_tools := [tool for tool in ("rg", "fzf") if not shutil.which(tool)]:
             _set_panel_text(
-                output_view,
+                state.output_view,
                 "Missing dependencies: {} (see the readme to install them)".format(
                     ", ".join(missing_tools)
                 ),
@@ -129,13 +131,33 @@ class TelescopeCommand(sublime_plugin.WindowCommand):
             input_view.run_command("select_all")
             input_view.run_command("insert", {"characters": state.text})
             input_view.run_command("select_all")
+        else:
+            # The reused input can hold text typed too quickly before the
+            # last close, never searched
+            input_view.run_command("select_all")
+            input_view.run_command("right_delete")
 
         # Attach after setting the text to only search once, below
         state.listener = InputListener(window)
         state.listener.attach(input_view.buffer())
 
-        if state.text:
+        if state.text and _search_context(state) != previous_search:
+            # New search: restart from the first result with an empty
+            # panel, the files may also have changed since the last search
+            state.highlight_index = 0
+            state.results = []
+            state.styled_line_cache.clear()
+            state.parser_view_path = None
+            _clear_result_phantoms(state)
+            _set_panel_text(state.output_view, "")
+            state.output_view.erase_regions("telescope-selected")
             _search(window, state.text)
+        elif state.results:
+            # Same search: the reused panel still shows the results and
+            # the highlighted line, only reopen the preview
+            _preview_result(window, state.results[state.highlight_index])
+            # The preview steals the focus when it opens a new file
+            window.focus_view(input_view)
 
 
 class TelescopeSetGlobsCommand(sublime_plugin.WindowCommand):
@@ -291,6 +313,20 @@ class TelescopeEventListener(sublime_plugin.EventListener):
         search_state.pop(window, None)
 
 
+def _search_context(state: SearchState) -> tuple:
+    """The parameters defining the search results.
+
+    Reopening the panel with the same ones keeps the previous search.
+    """
+    return (
+        state.text,
+        state.globs,
+        state.current_file,
+        # In current file mode the searched file matters
+        state.active_view if state.current_file else None,
+    )
+
+
 def _search(window: Window, text: str):
     state = search_state[window]
     if text != state.text:
@@ -317,24 +353,8 @@ def _search_in_background(window: Window, text: str):
             return
         state.results = results
         state.result_label_widths = _result_label_widths(results)
-        _clear_result_phantoms(state)
         state.highlight_index = min(state.highlight_index, max(len(results) - 1, 0))
-        _set_panel_text(
-            state.output_view,
-            (
-                "\n".join(
-                    _result_location_label(result, state.result_label_widths)
-                    for result in results
-                )
-                if results
-                else "No result"
-            ),
-        )
-        _update_result_phantoms(window)
-        if results:
-            _highlight_result_in_output_panel(window)
-        else:
-            state.output_view.erase_regions("telescope-selected")
+        _render_results(window)
         if len(text) >= _settings().get("min_query_length", 3):
             window.status_message(
                 "Telescope: {} results in {:.2f}s".format(
@@ -343,6 +363,29 @@ def _search_in_background(window: Window, text: str):
             )
 
     sublime.set_timeout(show_results)
+
+
+def _render_results(window: Window):
+    """Fill the panel with the labels, phantoms and highlight of the results."""
+    state = search_state[window]
+    results = state.results
+    _clear_result_phantoms(state)
+    _set_panel_text(
+        state.output_view,
+        (
+            "\n".join(
+                _result_location_label(result, state.result_label_widths)
+                for result in results
+            )
+            if results
+            else "No result"
+        ),
+    )
+    _update_result_phantoms(window)
+    if results:
+        _highlight_result_in_output_panel(window)
+    else:
+        state.output_view.erase_regions("telescope-selected")
 
 
 def _assign_panel_syntax(window: Window):
@@ -463,7 +506,7 @@ def _parser_view_for_result(window: Window, result: SearchResult) -> View | None
     """Load the search result in a view for color highlighting."""
     state = search_state[window]
     parser_view = state.parser_view
-    if not parser_view or not parser_view.is_valid():
+    if not parser_view:
         parser_view = window.create_output_panel(PARSER_PANEL_NAME, unlisted=True)
         parser_view.settings().set("gutter", False)
         parser_view.settings().set("word_wrap", False)
@@ -684,6 +727,10 @@ def _preview_result(window: Window, result: SearchResult):
         _highlight_result_in_preview(state.preview, result, state.text)
         return
 
+    # Switching file: erase the highlight left in the previous preview
+    if state.preview and state.preview.is_valid():
+        state.preview.erase_regions("telescope-result-view")
+
     # Transient: sublime keeps a single preview per group and replaces it
     # automatically when previewing an other file. The `ENCODED_POSITION`
     # moves the cursor, even if the file is still loading
@@ -753,7 +800,6 @@ def _close_panel(window: Window):
     if state.listener and state.listener.is_attached():
         state.listener.detach()
     _erase_result_regions(window)
-    _clear_result_phantoms(state)
     window.run_command("hide_panel", {"panel": "output." + PANEL_NAME})
     state.is_open = False
     # A pending `on_load` would highlight the preview after the close

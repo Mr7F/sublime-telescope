@@ -1,5 +1,6 @@
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -21,7 +22,22 @@ class TestTelescope(DeferrableTestCase):
             self.skipTest("missing external tools: {}".format(", ".join(missing_tools)))
 
         self.window = sublime.active_window()
+        # The unittest output panel, replaced by the telescope panel
+        self.previous_panel = self.window.active_panel()
+        self.previous_layout = self.window.layout()
         self._reset_telescope_state()
+
+        # Count the searches: one rg process per search, other packages
+        # also spawn unrelated processes
+        self.search_count = 0
+        self._popen = subprocess.Popen
+
+        def popen_spy(cmd, *args, **kwargs):
+            if cmd[0] == "rg":
+                self.search_count += 1
+            return self._popen(cmd, *args, **kwargs)
+
+        subprocess.Popen = popen_spy
         self.project_dir = tempfile.mkdtemp(prefix="sublime-telescope-", dir="/tmp")
         self.previous_project_data = self.window.project_data()
         self.views_to_close = []
@@ -37,6 +53,7 @@ class TestTelescope(DeferrableTestCase):
         )
 
     def tearDown(self):
+        subprocess.Popen = self._popen
         self.window.run_command("hide_overlay")
         self.window.run_command("telescope_cancel")
         self._reset_telescope_state()
@@ -51,9 +68,14 @@ class TestTelescope(DeferrableTestCase):
 
         self.window.set_project_data(self.previous_project_data or {"folders": []})
         shutil.rmtree(self.project_dir, ignore_errors=True)
+        self.window.set_layout(self.previous_layout)
+        if self.previous_panel:
+            self.window.run_command("show_panel", {"panel": self.previous_panel})
 
     def _reset_telescope_state(self):
         telescope = self._telescope_module()
+        # Erase the phantoms before dropping the state referencing them
+        telescope._clear_result_phantoms(telescope.search_state[self.window])
         telescope.search_state[self.window] = telescope.SearchState()
 
     def _telescope_module(self):
@@ -88,6 +110,7 @@ class TestTelescope(DeferrableTestCase):
         yield from self._press_enter()
         yield from self._replace_search_input("glob_unique_target")
         yield from self._wait_for_preview(target)
+        self.assertEqual(self._panel_text(), "first.py:1")
         yield from self._confirm()
         yield lambda: self.window.active_view().file_name() == target
 
@@ -123,11 +146,7 @@ class TestTelescope(DeferrableTestCase):
         yield from self._replace_search_input("folder_filter_needle")
         yield from self._wait_for_preview(target)
 
-        panel = self.window.find_output_panel("telescope")
-        self.assertEqual(
-            panel.substr(sublime.Region(0, panel.size())),
-            "match.py:1",
-        )
+        self.assertEqual(self._panel_text(), "match.py:1")
 
     def test_project_folder_include_patterns_limit_results(self):
         seed = _write(
@@ -160,11 +179,7 @@ class TestTelescope(DeferrableTestCase):
         yield from self._replace_search_input("include_filter_needle")
         yield from self._wait_for_preview(target)
 
-        panel = self.window.find_output_panel("telescope")
-        self.assertEqual(
-            panel.substr(sublime.Region(0, panel.size())),
-            "match.py:1",
-        )
+        self.assertEqual(self._panel_text(), "match.py:1")
 
     def test_current_file_search_opens_only_the_active_file(self):
         current = _write(
@@ -215,6 +230,8 @@ class TestTelescope(DeferrableTestCase):
         self.window.run_command("telescope", {"current_file": True})
         input_view = yield from self._wait_for_search_input_text("restore_unique_query")
 
+        # Reopening the same search does not search again
+        self.assertEqual(self.search_count, 1)
         self.assertEqual(self._input_text(input_view), "restore_unique_query")
         self.assertEqual(
             [region.to_tuple() for region in input_view.sel()],
@@ -250,6 +267,7 @@ class TestTelescope(DeferrableTestCase):
         self.window.run_command("telescope", {"current_file": True})
         yield from self._replace_search_input("navigate_needle")
         yield from self._wait_for_preview(current)
+        self.assertEqual(self._panel_text(), "navigate.py:1\nnavigate.py:2")
         self.assertEqual(self._highlighted_row(), 0)
 
         self.window.run_command("telescope_move", {"forward": True})
@@ -290,7 +308,12 @@ class TestTelescope(DeferrableTestCase):
         self.window.run_command("telescope", {"current_file": True})
         yield from self._wait_for_search_input_text("restore_index_query")
         yield from self._wait_for_preview(current)
+        # The results are kept, with the highlight, without a new search
+        self.assertEqual(
+            self._panel_text(), "restore_index.py:1\nrestore_index.py:2"
+        )
         self.assertEqual(self._highlighted_row(), 1)
+        self.assertEqual(self.search_count, 1)
 
         yield from self._confirm()
         yield lambda: self.window.active_view().file_name() == current
@@ -298,7 +321,79 @@ class TestTelescope(DeferrableTestCase):
         self.window.run_command("telescope", {"current_file": True})
         yield from self._wait_for_search_input_text("restore_index_query")
         yield from self._wait_for_preview(current)
+        self.assertEqual(
+            self._panel_text(), "restore_index.py:1\nrestore_index.py:2"
+        )
         self.assertEqual(self._highlighted_row(), 1)
+        self.assertEqual(self.search_count, 1)
+
+    def test_split_view_preview_highlight_follows_the_result(self):
+        """Test when we are in a split view, and result match on both view."""
+        file_a = _write(
+            os.path.join(self.project_dir, "split_a.py"),
+            "alpha split_view_needle one\n",
+        )
+        file_b = _write(
+            os.path.join(self.project_dir, "split_b.py"),
+            "alpha split_view_needle one\n",
+        )
+        self.window.set_layout(
+            {
+                "cols": [0.0, 0.5, 1.0],
+                "rows": [0.0, 1.0],
+                "cells": [[0, 0, 1, 1], [1, 0, 2, 1]],
+            }
+        )
+        self.window.focus_group(0)
+        yield from self._open_file(file_a)
+        self.window.focus_group(1)
+        yield from self._open_file(file_b)
+
+        self.window.run_command("telescope")
+        yield from self._replace_search_input("split_view_needle")
+        view_a = self._view_for_file(file_a)
+        view_b = self._view_for_file(file_b)
+        # One result per file, the first one previewed in its group
+        yield lambda: (
+            view_a.get_regions("telescope-result-view")
+            or view_b.get_regions("telescope-result-view")
+        )
+        if view_a.get_regions("telescope-result-view"):
+            first, second = view_a, view_b
+        else:
+            first, second = view_b, view_a
+
+        # Moving to the result of the other file moves the highlight
+        # there, without leaving one in the visible previous preview
+        self.window.run_command("telescope_move", {"forward": True})
+        yield lambda: second.get_regions("telescope-result-view")
+        self.assertEqual(first.get_regions("telescope-result-view"), [])
+
+    def test_switching_mode_resets_the_highlight(self):
+        current = _write(
+            os.path.join(self.project_dir, "mode_switch.py"),
+            "mode_switch_needle one\nmode_switch_needle two\n",
+        )
+        yield from self._open_file(current)
+
+        self.window.run_command("telescope", {"current_file": True})
+        yield from self._replace_search_input("mode_switch_needle")
+        yield from self._wait_for_preview(current)
+        self.window.run_command("telescope_move", {"forward": True})
+        yield 100
+        self.assertEqual(self._highlighted_row(), 1)
+
+        self.window.run_command("telescope_cancel")
+        yield 100
+
+        # The same search in the other mode is a new search, it restarts
+        # from the first result, without showing the previous results
+        self.window.run_command("telescope")
+        self.assertEqual(self._panel_text(), "")
+        yield from self._wait_for_search_input_text("mode_switch_needle")
+        yield from self._wait_for_preview(current)
+        self.assertEqual(self._highlighted_row(), 0)
+        self.assertEqual(self.search_count, 2)
 
     def test_selected_text_fills_current_file_search(self):
         current = _write(
@@ -457,6 +552,10 @@ class TestTelescope(DeferrableTestCase):
             ):
                 return view
         return None
+
+    def _panel_text(self):
+        panel = self.window.find_output_panel("telescope")
+        return panel.substr(sublime.Region(0, panel.size()))
 
     def _highlighted_row(self):
         panel = self.window.find_output_panel("telescope")

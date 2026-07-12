@@ -23,9 +23,9 @@ from .utils import debounced
 PANEL_NAME = "telescope"
 PARSER_PANEL_NAME = "telescope-syntax-parser"
 
-StyledToken = tuple[str, dict[str, Any]]
-LabelWidths = tuple[int, int]
-MatchIndexes = frozenset[int]
+StyledToken = "tuple[str, dict[str, Any]]"
+LabelWidths = "tuple[int, int]"
+MatchIndexes = " frozenset[int]"
 
 
 @dataclass
@@ -234,6 +234,18 @@ class TelescopeCancelCommand(sublime_plugin.WindowCommand):
     def run(self):
         _close_panel(self.window)
         _reset_window_state(self.window)
+
+
+class TelescopeReplaceCommand(sublime_plugin.TextCommand):
+    """Replace the complete contents of a view."""
+
+    def run(self, edit, text=""):
+        self.view.replace(
+            edit,
+            sublime.Region(0, self.view.size()),
+            text,
+        )
+        self.view.sel().clear()
 
 
 class InputListener(sublime_plugin.TextChangeListener):
@@ -909,6 +921,7 @@ def _live_search(window: Window, search_query: str) -> list[SearchResult]:
     fzf_process = _create_process(
         ["fzf", "--filter", search_query],
         stdin=rg_process.stdout,
+        decode_stdout=True,
     )
     rg_process.stdout.close()
     state.processes = (rg_process, fzf_process)
@@ -969,6 +982,7 @@ def _parse_rg_result(result: str) -> tuple[str, int, str] | None:
 def _create_process(
     args: list[str],
     stdin: Any | None = None,
+    decode_stdout: bool = False,
 ) -> subprocess.Popen:
     cmd_args: dict[str, Any] = {}
     if sys.platform.startswith("win"):
@@ -976,6 +990,12 @@ def _create_process(
         cmd_args["creationflags"] = CREATE_NO_WINDOW
     if stdin is not None:
         cmd_args["stdin"] = stdin
+    if decode_stdout:
+        cmd_args.update(
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
     return subprocess.Popen(
         args,
         stdout=subprocess.PIPE,
@@ -984,7 +1004,6 @@ def _create_process(
         # rg matches its globs against the paths relative to the working
         # directory: from the root they are the absolute paths
         cwd=os.path.abspath(os.sep),
-        text=True,
         shell=False,
         **cmd_args,
     )

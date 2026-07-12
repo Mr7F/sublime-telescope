@@ -25,7 +25,7 @@ PARSER_PANEL_NAME = "telescope-syntax-parser"
 
 StyledToken = "tuple[str, dict[str, Any]]"
 LabelWidths = "tuple[int, int]"
-MatchIndexes = " frozenset[int]"
+MatchIndexes = "frozenset[int]"
 
 
 @dataclass
@@ -44,7 +44,10 @@ class SearchState:
     text: str = ""
     highlight_index: int = 0
     results: list[SearchResult] = field(default_factory=list)
-    # The io panel views and input listener, set while the search is open
+    is_open: bool = False  # the search panel is open
+    phantom_refresh_active: bool = False
+    # The io panel views and input listener, they survive closing the
+    # panel: it is only hidden and reused on the next open
     output_view: View | None = None
     input_view: View | None = None
     listener: InputListener | None = None
@@ -84,17 +87,17 @@ class TelescopeCommand(sublime_plugin.WindowCommand):
 
         state = search_state[window]
         if globs is not None:
-            normalized_globs = _normalize_globs(globs)
-            if normalized_globs != state.globs:
-                state.highlight_index = 0
-            state.globs = normalized_globs
+            _set_globs(state, globs)
         state.current_file = current_file
 
         _close_panel(window)
+        # The files may have changed since the previous search
         state.styled_line_cache.clear()
+        state.parser_view_path = None
         output_view, input_view = window.create_io_panel(
             PANEL_NAME,
             on_input=lambda text: window.run_command("telescope_confirm"),
+            unlisted=True,
         )
 
         output_view.set_read_only(True)
@@ -104,6 +107,7 @@ class TelescopeCommand(sublime_plugin.WindowCommand):
 
         state.output_view = output_view
         state.input_view = input_view
+        state.is_open = True
         _assign_panel_syntax(window)
 
         window.run_command("show_panel", {"panel": "output." + PANEL_NAME})
@@ -139,7 +143,7 @@ class TelescopeSetGlobsCommand(sublime_plugin.WindowCommand):
 
     def run(self, globs: str | None = None):
         state = search_state[self.window]
-        if not state.input_view or state.current_file:
+        if not state.is_open or state.current_file:
             return
 
         if globs is None:
@@ -152,26 +156,23 @@ class TelescopeSetGlobsCommand(sublime_plugin.WindowCommand):
             )
             return
 
-        normalized_globs = _normalize_globs(globs)
-        if normalized_globs != state.globs:
-            state.highlight_index = 0
-        state.globs = normalized_globs
+        _set_globs(state, globs)
         self.window.focus_view(state.input_view)
         _search(self.window, state.text)
 
     def input(self, args: dict[str, Any]) -> sublime_plugin.InputHandler | None:
         state = search_state[self.window]
-        if "globs" in args or not state.input_view or state.current_file:
+        if "globs" in args or not state.is_open or state.current_file:
             return None
         return GlobsInputHandler(state.globs)
 
     def is_enabled(self) -> bool:
         state = search_state[self.window]
-        return bool(state.input_view and not state.current_file)
+        return bool(state.is_open and not state.current_file)
 
 
 class GlobsInputHandler(sublime_plugin.TextInputHandler):
-    """Input hadler to configure the globs."""
+    """Input handler to configure the globs."""
 
     def __init__(self, initial_value: str):
         self._initial_value = initial_value
@@ -219,9 +220,20 @@ class TelescopeConfirmCommand(sublime_plugin.WindowCommand):
         if not state.results:
             return
         result = state.results[state.highlight_index]
+        preview = state.preview
         _close_panel(self.window)
-        _restore_view_states(self.window)
-        # TODO: keep transient view if possible
+        # Skip the opened file: restoring its scroll position to move it
+        # back to the result just after would make it flick
+        _restore_view_states(self.window, skip=self.window.find_open_file(result.path))
+
+        if _can_update_preview_in_place(preview, result):
+            # Keep the preview view, promoted from transient to a real
+            # tab. Its cursor is already on the result
+            self.window.promote_sheet(preview.sheet())
+            self.window.focus_view(preview)
+            return
+
+        # The preview is still loading or was not opened
         self.window.open_file(
             _encoded_position(result),
             flags=sublime.SEMI_TRANSIENT | sublime.ENCODED_POSITION,
@@ -300,7 +312,7 @@ def _search_in_background(window: Window, text: str):
 
     def show_results():
         state = search_state[window]
-        if text != state.text or not state.output_view:
+        if text != state.text or not state.is_open:
             # The search changed or was closed in the meantime
             return
         state.results = results
@@ -334,13 +346,22 @@ def _search_in_background(window: Window, text: str):
 
 
 def _assign_panel_syntax(window: Window):
-    """Use a custom synthax to highlight the lin number."""
-    state = search_state[window]
-    state.output_view.assign_syntax("scope:text.telescope")
-    source_view = state.active_view or window.active_view()
+    """Use a custom syntax to highlight the line number."""
+    output_view = search_state[window].output_view
+    output_view.assign_syntax("scope:text.telescope")
+    _copy_color_scheme(window, output_view)
+
+
+def _copy_color_scheme(window: Window, view: View):
+    source_view = _source_view(window)
     color_scheme = source_view.settings().get("color_scheme") if source_view else None
     if color_scheme:
-        state.output_view.settings().set("color_scheme", color_scheme)
+        view.settings().set("color_scheme", color_scheme)
+
+
+def _source_view(window: Window) -> View | None:
+    """The view the search was opened from."""
+    return search_state[window].active_view or window.active_view()
 
 
 def _set_panel_text(view: View, text: str):
@@ -349,12 +370,12 @@ def _set_panel_text(view: View, text: str):
     view.set_read_only(True)
 
 
-# Output Pannel
+# Output Panel
 
 
 def _update_result_phantoms(window: Window):
     state = search_state[window]
-    if not state.output_view or not state.results:
+    if not state.results:
         return
 
     # Only render the visible rows, and only once: scrolling reveals the
@@ -404,8 +425,7 @@ def _update_result_phantom(window: Window, row: int):
 
 def _style_view(window: Window) -> View:
     """The view providing the selection and label colors of the results."""
-    state = search_state[window]
-    return state.active_view or window.active_view() or state.output_view
+    return _source_view(window) or search_state[window].output_view
 
 
 def _result_tokens(window: Window, result: SearchResult) -> list[StyledToken]:
@@ -414,7 +434,7 @@ def _result_tokens(window: Window, result: SearchResult) -> list[StyledToken]:
     key = (result.path, result.line_number)
     if key not in state.styled_line_cache:
         if state.current_file:
-            view = state.active_view or window.active_view()
+            view = _source_view(window)
         else:
             view = _parser_view_for_result(window, result)
         state.styled_line_cache[key] = _tokens_from_view(view, result) if view else []
@@ -462,11 +482,7 @@ def _parser_view_for_result(window: Window, result: SearchResult) -> View | None
     syntax = sublime.find_syntax_for_file(result.path, content.split("\n", 1)[0])
     if syntax:
         parser_view.assign_syntax(syntax)
-
-    source_view = state.active_view or window.active_view()
-    color_scheme = source_view.settings().get("color_scheme") if source_view else None
-    if color_scheme:
-        parser_view.settings().set("color_scheme", color_scheme)
+    _copy_color_scheme(window, parser_view)
 
     _set_panel_text(parser_view, content)
     state.parser_view_path = result.path
@@ -475,12 +491,18 @@ def _parser_view_for_result(window: Window, result: SearchResult) -> View | None
 
 def _start_phantom_refresh(window: Window):
     """Color the result rows lazily as they get scrolled or moved into view."""
-    output_view = search_state[window].output_view
+    state = search_state[window]
+    if state.phantom_refresh_active:
+        # Reopening reuses the loop of the previous search
+        return
+    state.phantom_refresh_active = True
 
     def refresh():
         state = search_state.get(window)
-        if not state or state.output_view != output_view:
-            # The panel was closed or reopened, this loop is done
+        if not state:
+            return
+        if not state.is_open:
+            state.phantom_refresh_active = False
             return
         _update_result_phantoms(window)
         sublime.set_timeout(refresh, 150)
@@ -725,22 +747,25 @@ def _erase_result_regions(window: Window):
 
 
 def _close_panel(window: Window):
+    """Close the io panel and clean the state."""
     state = search_state[window]
     _kill_search(window)
     if state.listener and state.listener.is_attached():
         state.listener.detach()
     _erase_result_regions(window)
     _clear_result_phantoms(state)
-    if state.output_view:
-        window.destroy_output_panel(PANEL_NAME)
-    if state.parser_view:
-        window.destroy_output_panel(PARSER_PANEL_NAME)
-    state.output_view = state.input_view = state.listener = None
-    state.parser_view = state.parser_view_path = None
+    window.run_command("hide_panel", {"panel": "output." + PANEL_NAME})
+    state.is_open = False
+    # A pending `on_load` would highlight the preview after the close
+    state.loading_preview = None
 
 
-def _normalize_globs(globs: str) -> str:
-    return ", ".join(g.strip() for g in globs.split(","))
+def _set_globs(state: SearchState, globs: str):
+    globs = ", ".join(g.strip() for g in globs.split(","))
+    if globs != state.globs:
+        # New globs, restart from the first result
+        state.highlight_index = 0
+    state.globs = globs
 
 
 def _close_preview(window: Window):
@@ -773,10 +798,10 @@ def _reset_window_state(window: Window):
     _restore_view_states(window)
 
 
-def _restore_view_states(window: Window):
+def _restore_view_states(window: Window, skip: View | None = None):
     """Restore the initial state (cursor position, scroll position, etc.)."""
     for view, (sel, viewport_position) in search_state[window].view_states.items():
-        if not view.is_valid():
+        if view == skip or not view.is_valid():
             continue
         view.sel().clear()
         view.sel().add_all(sel)
@@ -811,7 +836,7 @@ def _get_sidebar_folders(window: Window) -> list[str]:
     if not folders:
         return []
 
-    view = search_state[window].active_view or window.active_view()
+    view = _source_view(window)
     project_folders = (window.project_data() or {}).get("folders", [])
     args = []
 
@@ -891,7 +916,7 @@ def _live_search(window: Window, search_query: str) -> list[SearchResult]:
     ]
 
     state = search_state[window]
-    view = state.active_view or window.active_view()
+    view = _source_view(window)
 
     if state.current_file:
         if not view or not view.file_name():

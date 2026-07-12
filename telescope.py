@@ -297,9 +297,13 @@ def _search_in_background(window: Window, text: str):
         state.highlight_index = min(state.highlight_index, max(len(results) - 1, 0))
         _set_panel_text(
             state.output_view,
-            "\n".join(
-                _result_location_label(result, state.result_label_widths)
-                for result in results
+            (
+                "\n".join(
+                    _result_location_label(result, state.result_label_widths)
+                    for result in results
+                )
+                if results
+                else "No result"
             ),
         )
         _update_result_phantoms(window)
@@ -891,10 +895,10 @@ def _live_search(window: Window, search_query: str) -> list[SearchResult]:
             glob = glob.strip()
             if not glob:
                 continue
-            glob = re.sub(r"\*+", "**", glob)
             # `--type` exist, but it works only for a fixed list of types
             # mimic sublime text glob logic
-            rg_cmd.extend(("--iglob", f"**/*{glob}"))
+            for rg_glob in _convert_sublime_glob_to_rg_glob(glob):
+                rg_cmd.extend(("--iglob", rg_glob))
 
         rg_cmd += folders
 
@@ -909,7 +913,7 @@ def _live_search(window: Window, search_query: str) -> list[SearchResult]:
     rg_process.stdout.close()
     state.processes = (rg_process, fzf_process)
     results = []
-    for _ in range(settings.get("max_results", 50)):
+    for _ in range(settings.get("max_results", 5000)):
         line = fzf_process.stdout.readline().strip()
         if not line:
             break

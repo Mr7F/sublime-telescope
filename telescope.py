@@ -947,6 +947,8 @@ def _live_search(window: Window, search_query: str) -> list[SearchResult]:
 
     rg_cmd = [
         "rg",
+        "--field-match-separator", # use \0 as column deliminator instead of `:`
+        "\\x00",
         "--no-heading",
         "--max-filesize",
         str(settings.get("max_filesize", "100M")),
@@ -965,7 +967,7 @@ def _live_search(window: Window, search_query: str) -> list[SearchResult]:
     view = _source_view(window)
 
     if state.current_file:
-        if not view or not view.file_name():
+        if not view or not view.file_name() or "\n" in view.file_name():
             return []
         rg_cmd.append(view.file_name())
     else:
@@ -983,6 +985,9 @@ def _live_search(window: Window, search_query: str) -> list[SearchResult]:
             for rg_glob in _convert_sublime_glob_to_rg_glob(glob):
                 rg_cmd.extend(("--iglob", rg_glob))
 
+        # Newlines in paths split fzf's line-delimited records. Keep this
+        # exclude after user globs so it cannot be overridden.
+        rg_cmd.extend(("--iglob", "!*\n*"))
         rg_cmd += folders
 
     if settings.get("debug"):
@@ -990,7 +995,15 @@ def _live_search(window: Window, search_query: str) -> list[SearchResult]:
 
     rg_process = _create_process(rg_cmd)
     fzf_process = _create_process(
-        ["fzf", "--filter", search_query],
+        [
+            "fzf",
+            "--filter",
+            search_query,
+            "--delimiter",  # use \0 for column deliminator
+            "\\x00",
+            "--nth",  # only do fuzzy match on the third column (the file content)
+              "3..",
+        ],
         stdin=rg_process.stdout,
         decode_stdout=True,
     )
@@ -998,7 +1011,7 @@ def _live_search(window: Window, search_query: str) -> list[SearchResult]:
     state.processes = (rg_process, fzf_process)
     results = []
     for _ in range(settings.get("max_results", 5000)):
-        line = fzf_process.stdout.readline().strip()
+        line = fzf_process.stdout.readline().rstrip("\n")
         if not line:
             break
 
@@ -1012,7 +1025,8 @@ def _live_search(window: Window, search_query: str) -> list[SearchResult]:
             SearchResult(
                 path,
                 line_number,
-                # The match can be on the path, fall back to the content
+                 # fzf scores the full rg output, including the path, but rg already
+                  # guaranteed that the content fuzzy-matches the query.
                 min(match_indexes, default=len(content) - len(content.lstrip())),
                 content[:200],
             )
@@ -1038,16 +1052,15 @@ def _highlight_scope() -> str:
 
 
 def _parse_rg_result(result: str) -> tuple[str, int, str] | None:
-    drive = ""
-    if sys.platform.startswith("win"):
-        drive, _, result = result.partition(":")
-        drive += ":"
-
-    path, _, rest = result.partition(":")
-    line_number, _, content = rest.partition(":")
-    if not line_number.isdigit():
+    path, sep, rest = result.partition("\0")
+    if not sep:
         return None
-    return drive + path, int(line_number), content
+
+    line_number, sep, content = rest.partition("\0")
+    if not sep or not line_number.isdigit():
+        return None
+
+    return path, int(line_number), content
 
 
 def _create_process(

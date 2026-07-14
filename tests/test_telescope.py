@@ -117,6 +117,82 @@ class TestTelescope(DeferrableTestCase):
         self.assertEqual(self.window.active_view().file_name(), target)
         self.assertIsNone(self._view_for_file(ignored))
 
+    def test_project_search_fuzzy_scores_content_not_path(self):
+        """Check that the path is not used for fuzzy scoring."""
+        seed = _write(
+            os.path.join(self.project_dir, "seed.py"),
+            "open before searching\n",
+        )
+        # fuzzy ranking: file 1 path > file 2 content > file 1 content
+        better_path = _write(
+            # path has better ranking, but content ranking is worse
+            os.path.join(self.project_dir, "abc_path_rank.py"),
+            "a xxx b xxx c\n",
+        )
+        better_content = _write(
+            # path does not match fuzzy ranking, but content has better ranking
+            os.path.join(self.project_dir, "zzz_path_rank.py"),
+            "a---bc\n",
+        )
+        yield from self._open_file(seed)
+
+        self.window.run_command("telescope")
+        yield from self._replace_search_input("abc")
+        yield from self._wait_for_preview(better_content)
+
+        self.assertEqual(
+            self._panel_text(),
+            "zzz_path_rank.py:1\nabc_path_rank.py:1",
+        )
+        self.assertEqual(self._highlighted_row(), 0)
+        self.assertIsNotNone(self._view_for_file(better_content))
+        self.assertIsNone(self._view_for_file(better_path))
+
+    def test_project_search_excludes_newline_paths_even_when_glob_matches(self):
+        r"""Check that file with \n in their name are ignored.
+
+        File with \n in their path can break fzf parsing.
+        """
+        if sys.platform.startswith("win"):
+            self.skipTest("Windows filenames cannot contain newlines")
+
+        seed = _write(
+            os.path.join(self.project_dir, "seed.py"),
+            "open before searching\n",
+        )
+        target = _write(
+            os.path.join(self.project_dir, "normal_path.py"),
+            "newline_path_needle\n",
+        )
+        _write(
+            os.path.join(self.project_dir, "path_with\nnewline.py"),
+            "newline_path_needle\n",
+        )
+        yield from self._open_file(seed)
+
+        telescope = self._telescope_module()
+        telescope._set_globs(telescope.search_state[self.window], "*\n*, *")
+        results = telescope._live_search(self.window, "newline_path_needle")
+
+        self.assertEqual([result.path for result in results], [target])
+
+    def test_current_file_search_excludes_newline_path(self):
+        if sys.platform.startswith("win"):
+            self.skipTest("Windows filenames cannot contain newlines")
+
+        current = _write(
+            os.path.join(self.project_dir, "current\nfile.py"),
+            "newline_current_needle\n",
+        )
+        yield from self._open_file(current)
+
+        telescope = self._telescope_module()
+        state = telescope.search_state[self.window]
+        state.current_file = True
+        results = telescope._live_search(self.window, "newline_current_needle")
+
+        self.assertEqual(results, [])
+
     def test_project_folder_exclude_patterns_hide_results(self):
         seed = _write(
             os.path.join(self.project_dir, "seed.py"),
@@ -309,9 +385,7 @@ class TestTelescope(DeferrableTestCase):
         yield from self._wait_for_search_input_text("restore_index_query")
         yield from self._wait_for_preview(current)
         # The results are kept, with the highlight, without a new search
-        self.assertEqual(
-            self._panel_text(), "restore_index.py:1\nrestore_index.py:2"
-        )
+        self.assertEqual(self._panel_text(), "restore_index.py:1\nrestore_index.py:2")
         self.assertEqual(self._highlighted_row(), 1)
         self.assertEqual(self.search_count, 1)
 
@@ -321,9 +395,7 @@ class TestTelescope(DeferrableTestCase):
         self.window.run_command("telescope", {"current_file": True})
         yield from self._wait_for_search_input_text("restore_index_query")
         yield from self._wait_for_preview(current)
-        self.assertEqual(
-            self._panel_text(), "restore_index.py:1\nrestore_index.py:2"
-        )
+        self.assertEqual(self._panel_text(), "restore_index.py:1\nrestore_index.py:2")
         self.assertEqual(self._highlighted_row(), 1)
         self.assertEqual(self.search_count, 1)
 
@@ -354,9 +426,11 @@ class TestTelescope(DeferrableTestCase):
         view_a = self._view_for_file(file_a)
         view_b = self._view_for_file(file_b)
         # One result per file, the first one previewed in its group
-        yield lambda: (
-            view_a.get_regions("telescope-result-view")
-            or view_b.get_regions("telescope-result-view")
+        yield (
+            lambda: (
+                view_a.get_regions("telescope-result-view")
+                or view_b.get_regions("telescope-result-view")
+            )
         )
         if view_a.get_regions("telescope-result-view"):
             first, second = view_a, view_b
@@ -474,6 +548,29 @@ class TestTelescope(DeferrableTestCase):
         self.assertEqual(self.window.active_view(), view)
         self.assertEqual([region.to_tuple() for region in view.sel()], [(10, 10)])
         self.assertEqual(view.viewport_position(), (0, 350))
+
+    def test_parse_rg_result(self):
+        telescope = self._telescope_module()
+        SEPARATOR = "\0"
+        content = f"hello{SEPARATOR}world"  # the content of the line has the separator
+        # Windows
+        self.assertEqual(
+            telescope._parse_rg_result(f"C:\\proj\\file.py{SEPARATOR}12{SEPARATOR}{content}"),
+            (r"C:\proj\file.py", 12, content),
+        )
+
+        # Linux / MacOS
+        self.assertEqual(
+            telescope._parse_rg_result(f"/proj/file.py{SEPARATOR}12{SEPARATOR}{content}"),
+            ("/proj/file.py", 12, content),
+        )
+        self.assertIsNone(
+            telescope._parse_rg_result(f"/proj/file.py{SEPARATOR}not-a-line{SEPARATOR}{content}")
+        )
+        self.assertEqual(
+            telescope._parse_rg_result(f"/proj/path-with-semicolon-:-/file.py{SEPARATOR}12{SEPARATOR}{content}"),
+            ("/proj/path-with-semicolon-:-/file.py", 12, content),
+        )
 
     def _open_file(self, path: str):
         view = self.window.open_file(path)

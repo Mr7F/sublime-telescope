@@ -1,0 +1,14 @@
+%YAML 1.2
+---
+name: Telescope Input
+scope: text.telescope.input
+hidden: true
+version: 2
+
+contexts:
+  main:
+    - match: '^(.+?)( {2,})(.*)$'
+      captures:
+        1: string.unquoted.directory-glob.telescope
+        2: punctuation.separator.telescope
+        3: text.telescope.search-query

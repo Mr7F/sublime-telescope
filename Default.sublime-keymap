@@ -22,13 +22,6 @@
             {"key": "setting.telescope_input", "operator": "equal", "operand": true}
         ]
     },
-    {
-        "keys": ["shift+escape"],
-        "command": "telescope_set_globs",
-        "context": [
-            {"key": "setting.telescope_input", "operator": "equal", "operand": true}
-        ]
-    },
     // {
     //     "keys": [
     //         "ctrl+i"

@@ -3,7 +3,7 @@ Sublime text plugin that mimic the "live grep" feature of the [telescope](https:
 
 That plugin work with [ripgrep](https://github.com/BurntSushi/ripgrep) and [fzf](https://github.com/junegunn/fzf)
 
-It will **fuzzy find** in all files following a glob expression,
+It will **fuzzy find** in all files in the current project,
 - it will first use ripgrep, if you enter `acbd`, it will look for the regex `.*a.*b.*c.*d.*`
 - it will apply fuzzy search on the result with fzf
 - it will keep the 5000 best results (fzf scoring)
@@ -14,12 +14,12 @@ Ripgrep and fzf are configured in **"smart case"** mode (case insensitive if eve
 
 The results are shown in an output panel; use the up/down arrows to navigate them (the highlighted result is previewed), enter to open it and escape to cancel and go back where you was.
 
-To reduce the search space, you can set a glob filter to apply on the files by pressing `shift+esc`, like the sublime text search, you can specify many globs separated by a comma:
-- `<empty>`: use the default ripgrep filters (follow `gitignore`, skip hidden files and binary, etc)
-- `models/*.py`
-- `.py`
-- `.py, .js`
-- `/views/*/src/*.html`
+To reduce the search space in project mode, put a directory glob, two spaces, then the search query:
+- `models  search_user`: search for `search_user` in directories matching `models`
+- `enterprise/*/models  search_user`: search in matching model directories
+- `models,views  kanban`: search in directories matching either `models` or `views`
+
+Without two spaces, the whole input is used as the search query. Current-file mode ignores the directory glob in the input; when switching back to project mode, the previous directory glob is shown again.
 
 In addition to the default `ripgrep` behavior (ignoring file specified in `.gitignore`, etc), it will ignore files matching
 - `binary_file_patterns`
@@ -49,7 +49,7 @@ See `Preferences > Package Settings > Telescope > Settings` to tweak the number 
 }
 ```
 
-Search using globs:
+Search in the project:
 ```json
 {
     "keys": ["ctrl+shift+i"],

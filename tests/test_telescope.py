@@ -88,27 +88,23 @@ class TestTelescope(DeferrableTestCase):
                 return module
         raise RuntimeError("sublime-telescope plugin module is not loaded")
 
-    def test_project_search_uses_globs_and_opens_matching_file(self):
+    def test_project_search_uses_directory_glob_and_opens_matching_file(self):
         seed = _write(
             os.path.join(self.project_dir, "seed.py"),
             "open before searching\n",
         )
         target = _write(
-            os.path.join(self.project_dir, "first.py"),
+            os.path.join(self.project_dir, "models", "first.py"),
             "alpha glob_unique_target one\n",
         )
         ignored = _write(
-            os.path.join(self.project_dir, "ignored.txt"),
+            os.path.join(self.project_dir, "views", "ignored.py"),
             "alpha glob_unique_target one\n",
         )
         yield from self._open_file(seed)
 
         self.window.run_command("telescope")
-        # As bound to shift+escape in the search input
-        self.window.run_command("telescope_set_globs")
-        yield from self._replace_glob_input("*.py")
-        yield from self._press_enter()
-        yield from self._replace_search_input("glob_unique_target")
+        yield from self._replace_search_input("models  glob_unique_target")
         yield from self._wait_for_preview(target)
         self.assertEqual(self._panel_text(), "first.py:1")
         yield from self._confirm()
@@ -148,7 +144,7 @@ class TestTelescope(DeferrableTestCase):
         self.assertIsNotNone(self._view_for_file(better_content))
         self.assertIsNone(self._view_for_file(better_path))
 
-    def test_project_search_excludes_newline_paths_even_when_glob_matches(self):
+    def test_project_search_excludes_newline_paths_even_when_directory_glob_matches(self):
         r"""Check that file with \n in their name are ignored.
 
         File with \n in their path can break fzf parsing.
@@ -161,18 +157,17 @@ class TestTelescope(DeferrableTestCase):
             "open before searching\n",
         )
         target = _write(
-            os.path.join(self.project_dir, "normal_path.py"),
+            os.path.join(self.project_dir, "kept", "normal_path.py"),
             "newline_path_needle\n",
         )
         _write(
-            os.path.join(self.project_dir, "path_with\nnewline.py"),
+            os.path.join(self.project_dir, "kept", "path_with\nnewline.py"),
             "newline_path_needle\n",
         )
         yield from self._open_file(seed)
 
         telescope = self._telescope_module()
-        telescope._set_globs(telescope.search_state[self.window], "*\n*, *")
-        results = telescope._live_search(self.window, "newline_path_needle")
+        results = telescope._live_search(self.window, "newline_path_needle", "kept")
 
         self.assertEqual([result.path for result in results], [target])
 
@@ -314,24 +309,38 @@ class TestTelescope(DeferrableTestCase):
             [(0, len("restore_unique_query"))],
         )
 
-    def test_current_file_search_is_restored_when_reopening_glob_mode(self):
+    def test_directory_glob_is_hidden_in_current_file_mode_and_restored_in_project_mode(self):
         current = _write(
-            os.path.join(self.project_dir, "restore_glob.py"),
+            os.path.join(self.project_dir, "models", "restore_glob.py"),
             "restore_glob_query in active file\n",
         )
         yield from self._open_file(current)
 
-        self.window.run_command("telescope", {"current_file": True})
-        yield from self._replace_search_input("restore_glob_query")
+        self.window.run_command("telescope")
+        yield from self._replace_search_input("models  restore_glob_query")
         yield from self._wait_for_preview(current)
         yield from self._confirm()
         yield lambda: self.window.active_view().file_name() == current
 
-        self.window.run_command("telescope", {"globs": "*"})
+        self.window.run_command("telescope", {"current_file": True})
         input_view = yield from self._wait_for_search_input_text("restore_glob_query")
-
-        # should have restored the search we did in the "current file mode"
         self.assertEqual(self._input_text(input_view), "restore_glob_query")
+        self.assertEqual(
+            [region.to_tuple() for region in input_view.sel()],
+            [(0, len("restore_glob_query"))],
+        )
+        self.window.run_command("telescope_cancel")
+        yield 100
+
+        self.window.run_command("telescope")
+        input_view = yield from self._wait_for_search_input_text(
+            "models  restore_glob_query"
+        )
+        self.assertEqual(self._input_text(input_view), "models  restore_glob_query")
+        self.assertEqual(
+            [region.to_tuple() for region in input_view.sel()],
+            [(len("models  "), len("models  restore_glob_query"))],
+        )
 
     def test_up_down_moves_the_highlight_without_wrapping(self):
         current = _write(
@@ -490,7 +499,7 @@ class TestTelescope(DeferrableTestCase):
             [(0, len("selected_query_text"))],
         )
 
-    def test_selected_text_fills_glob_search_after_glob_input(self):
+    def test_selected_text_fills_project_search(self):
         current = _write(
             os.path.join(self.project_dir, "selection_glob.py"),
             "one\nselected_glob_query_text in active file\n",
@@ -505,10 +514,6 @@ class TestTelescope(DeferrableTestCase):
         yield 25
 
         self.window.run_command("telescope")
-        # As bound to shift+escape in the search input
-        self.window.run_command("telescope_set_globs")
-        yield from self._replace_glob_input("*")
-        yield from self._press_enter()
         input_view = yield from self._wait_for_search_input_text(
             "selected_glob_query_text"
         )
@@ -580,14 +585,6 @@ class TestTelescope(DeferrableTestCase):
         yield 25
         return view
 
-    def _replace_glob_input(self, text: str):
-        input_view = yield from self._wait_for_glob_input()
-        input_view.sel().clear()
-        input_view.sel().add(sublime.Region(0, input_view.size()))
-        input_view.run_command("insert", {"characters": text})
-        yield 150
-        return input_view
-
     def _replace_search_input(self, text: str):
         input_view = yield from self._wait_for_search_input()
         input_view.run_command("select_all")
@@ -595,17 +592,9 @@ class TestTelescope(DeferrableTestCase):
         yield 750  # wait for the debounced live search
         return input_view
 
-    def _press_enter(self):
-        self.window.run_command("select")
-        yield 150
-
     def _confirm(self):
         self.window.run_command("telescope_confirm")
         yield 150
-
-    def _wait_for_glob_input(self):
-        yield lambda: self._glob_input_view() is not None
-        return self._glob_input_view()
 
     def _wait_for_search_input(self):
         yield lambda: self._search_input_view() is not None
@@ -626,17 +615,6 @@ class TestTelescope(DeferrableTestCase):
         # The preview highlights the fuzzy matched text
         yield lambda: view.get_regions("telescope-result-view")
         return view
-
-    def _glob_input_view(self):
-        for buffer in sublime._buffers():
-            view = buffer.primary_view()
-            if (
-                view
-                and view.element() == "command_palette:input"
-                and view.window() == self.window
-            ):
-                return view
-        return None
 
     def _search_input_view(self):
         for buffer in sublime._buffers():

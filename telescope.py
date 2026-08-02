@@ -39,7 +39,7 @@ class SearchResult:
 
 @dataclass
 class SearchState:
-    globs: str = ""
+    directory_glob: str = ""
     current_file: bool = False  # search only in the current file
     text: str = ""
     highlight_index: int = 0
@@ -80,15 +80,15 @@ search_state: defaultdict[Window, SearchState] = defaultdict(SearchState)
 class TelescopeCommand(sublime_plugin.WindowCommand):
     """Open the search io panel."""
 
-    def run(self, globs: str | None = None, current_file: bool = False):
+    def run(self, directory_glob: str | None = None, current_file: bool = False):
         window = self.window
         state = search_state[window]
         previous_search = _search_context(state)
 
         _save_window_state(window)
         _set_search_text_from_selection(window)
-        if globs is not None:
-            _set_globs(state, globs)
+        if directory_glob is not None:
+            _set_directory_glob(state, directory_glob)
         state.current_file = current_file
 
         _close_panel(window)
@@ -109,6 +109,7 @@ class TelescopeCommand(sublime_plugin.WindowCommand):
             state.input_view = input_view
 
         input_view = state.input_view
+        input_view.assign_syntax("scope:text.telescope.input")
         state.is_open = True
         _assign_panel_syntax(window)
 
@@ -126,11 +127,12 @@ class TelescopeCommand(sublime_plugin.WindowCommand):
 
         _start_phantom_refresh(window)
 
-        if state.text:
+        input_text = _input_text(state)
+        if input_text:
             # Restore the previous search, but select the text
             input_view.run_command("select_all")
-            input_view.run_command("insert", {"characters": state.text})
-            input_view.run_command("select_all")
+            input_view.run_command("insert", {"characters": input_text})
+            _select_search_text(input_view, state)
         else:
             # The reused input can hold text typed too quickly before the
             # last close, never searched
@@ -151,71 +153,13 @@ class TelescopeCommand(sublime_plugin.WindowCommand):
             _clear_result_phantoms(state)
             _set_panel_text(state.output_view, "")
             state.output_view.erase_regions("telescope-selected")
-            _search(window, state.text)
+            _search(window, input_text)
         elif state.results:
             # Same search: the reused panel still shows the results and
             # the highlighted line, only reopen the preview
             _preview_result(window, state.results[state.highlight_index])
             # The preview steals the focus when it opens a new file
             window.focus_view(input_view)
-
-
-class TelescopeSetGlobsCommand(sublime_plugin.WindowCommand):
-    """Ask for globs while the project search input panel is open."""
-
-    def run(self, globs: str | None = None):
-        state = search_state[self.window]
-        if not state.is_open or state.current_file:
-            return
-
-        if globs is None:
-            self.window.run_command(
-                "show_overlay",
-                {
-                    "overlay": "command_palette",
-                    "command": "telescope_set_globs",
-                },
-            )
-            return
-
-        _set_globs(state, globs)
-        self.window.focus_view(state.input_view)
-        _search(self.window, state.text)
-
-    def input(self, args: dict[str, Any]) -> sublime_plugin.InputHandler | None:
-        state = search_state[self.window]
-        if "globs" in args or not state.is_open or state.current_file:
-            return None
-        return GlobsInputHandler(state.globs)
-
-    def is_enabled(self) -> bool:
-        state = search_state[self.window]
-        return bool(state.is_open and not state.current_file)
-
-
-class GlobsInputHandler(sublime_plugin.TextInputHandler):
-    """Input handler to configure the globs."""
-
-    def __init__(self, initial_value: str):
-        self._initial_value = initial_value
-
-    def name(self) -> str:
-        return "globs"
-
-    def placeholder(self) -> str:
-        return ".py, .js, views/*.html"
-
-    def validate(self, text: str) -> bool:
-        return not text or bool(text.strip())
-
-    def description(self, value: str) -> str:
-        return value or "All"
-
-    def initial_text(self) -> str:
-        return self._initial_value
-
-    def initial_selection(self) -> list[tuple[int, int]]:
-        return [(0, len(self._initial_value))]
 
 
 class TelescopeMoveCommand(sublime_plugin.WindowCommand):
@@ -320,42 +264,53 @@ def _search_context(state: SearchState) -> tuple:
     """
     return (
         state.text,
-        state.globs,
+        state.directory_glob if not state.current_file else "",
         state.current_file,
         # In current file mode the searched file matters
         state.active_view if state.current_file else None,
     )
 
 
-def _search(window: Window, text: str):
+def _search(window: Window, input_text: str):
     state = search_state[window]
-    if text != state.text:
+    directory_glob, search_query = _parse_input_text(input_text, state.current_file)
+    if search_query != state.text or (
+        not state.current_file and directory_glob != state.directory_glob
+    ):
         # New search, restart from the first result
         state.highlight_index = 0
-    state.text = text
+    state.text = search_query
+    if not state.current_file:
+        state.directory_glob = directory_glob
     _kill_search(window)
+    search_context = _search_context(state)
     # Search in the background, it can lag on big projects
     threading.Thread(
         target=_search_in_background,
-        args=(window, text),
+        args=(window, search_query, state.directory_glob, search_context),
         daemon=True,
     ).start()
 
 
-def _search_in_background(window: Window, text: str):
+def _search_in_background(
+    window: Window,
+    search_query: str,
+    directory_glob: str,
+    search_context: tuple,
+):
     start = time.time()
-    results = _live_search(window, text)
+    results = _live_search(window, search_query, directory_glob)
 
     def show_results():
         state = search_state[window]
-        if text != state.text or not state.is_open:
+        if _search_context(state) != search_context or not state.is_open:
             # The search changed or was closed in the meantime
             return
         state.results = results
         state.result_label_widths = _result_label_widths(results)
         state.highlight_index = min(state.highlight_index, max(len(results) - 1, 0))
         _render_results(window)
-        if len(text) >= _settings().get("min_query_length", 3):
+        if len(search_query) >= _settings().get("min_query_length", 3):
             window.status_message(
                 "Telescope: {} results in {:.2f}s".format(
                     len(results), time.time() - start
@@ -806,12 +761,39 @@ def _close_panel(window: Window):
     state.loading_preview = None
 
 
-def _set_globs(state: SearchState, globs: str):
-    globs = ", ".join(g.strip() for g in globs.split(","))
-    if globs != state.globs:
-        # New globs, restart from the first result
+def _set_directory_glob(state: SearchState, directory_glob: str):
+    directory_glob = directory_glob.strip()
+    if directory_glob != state.directory_glob:
+        # New directory filter, restart from the first result
         state.highlight_index = 0
-    state.globs = globs
+    state.directory_glob = directory_glob
+
+
+def _input_text(state: SearchState) -> str:
+    if state.current_file or not state.directory_glob:
+        return state.text
+    return f"{state.directory_glob}  {state.text}"
+
+
+def _select_search_text(input_view: View, state: SearchState):
+    if state.current_file or not state.directory_glob:
+        input_view.run_command("select_all")
+        return
+
+    start = len(state.directory_glob) + 2
+    input_view.sel().clear()
+    input_view.sel().add(sublime.Region(start, start + len(state.text)))
+
+
+def _parse_input_text(input_text: str, current_file: bool) -> tuple[str, str]:
+    if current_file:
+        return "", input_text.strip()
+
+    parts = re.split(r"( {2,})", input_text, 1)
+    if len(parts) == 1:
+        return "", input_text.strip()
+    directory_glob, _separator, search_query = parts
+    return directory_glob.strip(), search_query.strip()
 
 
 def _close_preview(window: Window):
@@ -940,7 +922,19 @@ def _convert_sublime_glob_to_rg_glob(
     return [pattern]
 
 
-def _live_search(window: Window, search_query: str) -> list[SearchResult]:
+def _directory_glob_patterns(directory_glob: str) -> list[str]:
+    return [
+        pattern.strip()
+        for pattern in directory_glob.split(",")
+        if pattern.strip() and "\n" not in pattern
+    ]
+
+
+def _live_search(
+    window: Window,
+    search_query: str,
+    directory_glob: str = "",
+) -> list[SearchResult]:
     settings = _settings()
     if len(search_query) < settings.get("min_query_length", 3):
         return []
@@ -966,6 +960,7 @@ def _live_search(window: Window, search_query: str) -> list[SearchResult]:
     state = search_state[window]
     view = _source_view(window)
 
+    folders = []
     if state.current_file:
         if not view or not view.file_name() or "\n" in view.file_name():
             return []
@@ -976,17 +971,14 @@ def _live_search(window: Window, search_query: str) -> list[SearchResult]:
             # Without folders rg would search its working directory
             return []
 
-        for glob in state.globs.split(","):
-            glob = glob.strip()
-            if not glob:
-                continue
-            # `--type` exist, but it works only for a fixed list of types
-            # mimic sublime text glob logic
-            for rg_glob in _convert_sublime_glob_to_rg_glob(glob):
+        for glob in _directory_glob_patterns(directory_glob):
+            # `--type` exists, but it works only for a fixed list of types.
+            # Keep the same glob behavior as Sublime project folder filters.
+            for rg_glob in _convert_sublime_glob_to_rg_glob(glob, directory=True):
                 rg_cmd.extend(("--iglob", rg_glob))
 
         # Newlines in paths split fzf's line-delimited records. Keep this
-        # exclude after user globs so it cannot be overridden.
+        # exclude after directory globs so it cannot be overridden.
         rg_cmd.extend(("--iglob", "!*\n*"))
         rg_cmd += folders
 
@@ -994,16 +986,17 @@ def _live_search(window: Window, search_query: str) -> list[SearchResult]:
         print(" ".join(rg_cmd))
 
     rg_process = _create_process(rg_cmd)
+    fzf_cmd = [
+        "fzf",
+        "--filter",
+        search_query,
+        "--delimiter",  # use \0 for column deliminator
+        "\\x00",
+        "--nth",  # only do fuzzy match on the third column (the file content)
+        "3..",
+    ]
     fzf_process = _create_process(
-        [
-            "fzf",
-            "--filter",
-            search_query,
-            "--delimiter",  # use \0 for column deliminator
-            "\\x00",
-            "--nth",  # only do fuzzy match on the third column (the file content)
-              "3..",
-        ],
+        fzf_cmd,
         stdin=rg_process.stdout,
         decode_stdout=True,
     )

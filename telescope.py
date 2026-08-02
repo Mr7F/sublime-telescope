@@ -17,7 +17,7 @@ from itertools import groupby
 from sublime import View, Window
 from typing import Any
 
-from .utils import debounced
+from .utils import _convert_sublime_glob_to_rg_glob, debounced
 
 
 PANEL_NAME = "telescope"
@@ -878,48 +878,40 @@ def _get_sidebar_folders(window: Window) -> list[str]:
         for path, folder in zip(folders, project_folders):
             include_globs = []
             for pattern in folder.get("file_include_patterns") or []:
-                include_globs += _convert_sublime_glob_to_rg_glob(pattern)
+                include_globs += _convert_sublime_glob_to_rg_glob(
+                    pattern,
+                    roots=[path],
+                )
             for pattern in folder.get("folder_include_patterns") or []:
                 include_globs += _convert_sublime_glob_to_rg_glob(
-                    pattern, directory=True
+                    pattern,
+                    directory=True,
+                    roots=[path],
                 )
             for glob in include_globs or [f"{path}/**"]:
                 args += ("--iglob", glob)
 
     # The excludes come last: for rg the last matching glob wins, they
     # apply within the included entries
-    sources = ([view.settings()] if view else []) + project_folders
-    for source in sources:
+    sources = []
+    if view:
+        sources.append((view.settings(), folders))
+    sources.extend((folder, [path]) for path, folder in zip(folders, project_folders))
+    for source, roots in sources:
         for pattern in source.get("folder_exclude_patterns") or []:
-            for glob in _convert_sublime_glob_to_rg_glob(pattern, directory=True):
+            for glob in _convert_sublime_glob_to_rg_glob(
+                pattern,
+                directory=True,
+                roots=roots,
+            ):
                 args += ("--iglob", f"!{glob}")
         file_patterns = source.get("file_exclude_patterns") or []
         file_patterns += source.get("binary_file_patterns") or []
         for pattern in file_patterns:
-            for glob in _convert_sublime_glob_to_rg_glob(pattern):
+            for glob in _convert_sublime_glob_to_rg_glob(pattern, roots=roots):
                 args += ("--iglob", f"!{glob}")
 
     return args + folders
-
-
-def _convert_sublime_glob_to_rg_glob(
-    pattern: str,
-    directory: bool = False,
-) -> list[str]:
-    """Convert an include/exclude pattern of sublime to rg globs.
-
-    Sublime matches them with fnmatch: patterns without a separator
-    match the entry names at any depth, and `*` also matches separators.
-    Directory patterns hide or show everything below them.
-    """
-    if not pattern.startswith("/"):
-        pattern = f"**/{pattern}"
-    if directory:
-        return [f"{pattern}/**"]
-    if pattern.endswith("*"):
-        # The trailing `*` also matches in the folders below
-        return [pattern, f"{pattern}/**"]
-    return [pattern]
 
 
 def _directory_glob_patterns(directory_glob: str) -> list[str]:
@@ -974,7 +966,11 @@ def _live_search(
         for glob in _directory_glob_patterns(directory_glob):
             # `--type` exists, but it works only for a fixed list of types.
             # Keep the same glob behavior as Sublime project folder filters.
-            for rg_glob in _convert_sublime_glob_to_rg_glob(glob, directory=True):
+            for rg_glob in _convert_sublime_glob_to_rg_glob(
+                glob,
+                directory=True,
+                roots=window.folders(),
+            ):
                 rg_cmd.extend(("--iglob", rg_glob))
 
         # Newlines in paths split fzf's line-delimited records. Keep this

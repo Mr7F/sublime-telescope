@@ -55,7 +55,11 @@ class SublimeGlobVectorTests(DeferrableTestCase):
         yield from self._open_file(self.path("seed.py"))
         vectors = [
             ("file", "*.md", {"pkg/alpha.md"}),
-            ("file", "alpha.py", {"alpha.py", "pkg/alpha.py"}),
+            (
+                "file",
+                "alpha.py",
+                {"alpha.py", "pkg/alpha.py", "pkg/deep/alpha.py"},
+            ),
             ("file", "pkg/alpha.py", {"pkg/alpha.py"}),
             ("file", "parent/*one.py", {"parent/mydir/a/b/one.py"}),
             (
@@ -85,7 +89,11 @@ class SublimeGlobVectorTests(DeferrableTestCase):
                     "parent/mydir/three/deep/nested_report",
                 },
             ),
-            ("file", "alp?a.py", {"alpha.py", "pkg/alpha.py"}),
+            (
+                "file",
+                "alp?a.py",
+                {"alpha.py", "pkg/alpha.py", "pkg/deep/alpha.py"},
+            ),
             ("file", "//alpha.py", {"alpha.py"}),
             ("file", "a[1].txt", {"literal/a[1].txt"}),
             ("file", "literal/a{2}.txt", {"literal/a{2}.txt"}),
@@ -113,6 +121,78 @@ class SublimeGlobVectorTests(DeferrableTestCase):
             telescope_paths = self._telescope_live_search_paths(NEEDLE)
             self.assertEqual(telescope_paths, expected, where)
 
+    def test_path_globs_match_sublime_find_in_files(self):
+        yield from self._open_file(self.path("seed.py"))
+        patterns = (
+            "*.md",
+            "alpha.py",
+            "pkg/alpha.py",
+            "parent/*one.py",
+            "mydir/tw*",
+            "mydir/tw*.py",
+            "mydir/th*_report",
+            "alp?a.py",
+            "//alpha.py",
+            "a[1].txt",
+            "literal/a{2}.txt",
+            "mydir/two",
+            "mydir/two/",
+            "mydir/*one/",
+            "//mydir/five/",
+            "./mydir/five/",
+            self.path("mydir/five") + "/",
+            "*.py,*.md",
+            "*.py,-alpha.py",
+            "**/*.py",
+            "parent/**/one.py",
+            "parent/*/one.py",
+            "*.PY",
+            "*.*",
+            "mydir/*.*",
+            "-*.txt",
+            "*.py,-pkg/*",
+            "mydir/*",
+            "mydir/**",
+            "mydir/two/*.py",
+            "mydir/two/*/last.py",
+            "mydir/two/**/last.py",
+            "literal/*",
+            "*.py, *.md",
+            "*.py,-*/one.py",
+            "//*.py",
+            self.path("alpha.py"),
+            "*",
+            "-alpha.py,*.py",
+            "*.py,-alpha.py,alpha.py",
+            "*.py,-*.PY",
+            "*.PY,-UPPER.PY",
+            "space name.py",
+            "space*.py",
+            "dir space/*.py",
+            "folder.py",
+            "*.py,-pkg/",
+            "*.py,-pkg/deep/*",
+            "*.py,-**/deep/**",
+        )
+
+        mismatches = {}
+        for where in patterns:
+            sublime_paths = yield from self._sublime_find_in_files_paths(where)
+            telescope_paths = self._telescope_path_glob_paths(where)
+            if telescope_paths != sublime_paths:
+                mismatches[where] = {
+                    "telescope": sorted(
+                        os.path.relpath(path, self.project_dir)
+                        for path in telescope_paths
+                    ),
+                    "sublime": sorted(
+                        os.path.relpath(path, self.project_dir)
+                        for path in sublime_paths
+                    ),
+                }
+        self.maxDiff = None
+        self.assertEqual(mismatches, {})
+
     def test_converter_output_for_representative_vectors(self):
         utils = self._utils_module()
         root = self.project_dir
@@ -121,6 +201,10 @@ class SublimeGlobVectorTests(DeferrableTestCase):
         self.assertEqual(
             utils._convert_sublime_glob_to_rg_glob("*.py", roots=[root]),
             [f"{root}/**/*.py"],
+        )
+        self.assertEqual(
+            utils._convert_sublime_glob_to_rg_glob("*.*", roots=[root]),
+            [f"{root}/**/*"],
         )
         self.assertEqual(
             utils._convert_sublime_glob_to_rg_glob(
@@ -187,13 +271,32 @@ class SublimeGlobVectorTests(DeferrableTestCase):
             utils._convert_sublime_glob_to_rg_glob(self.path("mydir/five") + "/"),
             [self.path("mydir/five") + "/**"],
         )
+        sidebar_root = self.path("workspace")
+        self.assertEqual(
+            utils._convert_sublime_glob_to_rg_glob(
+                "workspace/writable",
+                directory=True,
+                roots=[sidebar_root],
+            ),
+            [
+                f"{sidebar_root}/**/workspace/writable/**",
+                f"{sidebar_root}/writable/**",
+            ],
+        )
 
     def _write_fixture(self):
         for relative_path in (
             "seed.py",
             "alpha.py",
+            "UPPER.PY",
             "alpha.txt",
+            ".hidden.py",
+            "space name.py",
+            "dir space/space child.py",
+            "folder.py/inside.py",
+            "folder.py/inside.txt",
             "pkg/alpha.py",
+            "pkg/deep/alpha.py",
             "pkg/alpha.md",
             "parent/mydir/two/first.py",
             "parent/mydir/two_sub/ignored.py",
@@ -238,6 +341,42 @@ class SublimeGlobVectorTests(DeferrableTestCase):
     def _telescope_live_search_paths(self, pattern: str):
         telescope = self._telescope_module()
         return {result.path for result in telescope._live_search(self.window, pattern)}
+
+    def _telescope_path_glob_paths(self, where: str):
+        telescope = self._telescope_module()
+        return {
+            result.path
+            for result in telescope._live_search(self.window, NEEDLE, where)
+        }
+
+    def _sublime_find_in_files_paths(self, where: str):
+        native_where = (
+            where
+            if where.startswith(("./", "/")) and not where.startswith("//")
+            else f"<open folders>,{where}"
+        )
+        self.window.run_command(
+            "show_panel",
+            {
+                "panel": "find_in_files",
+                "pattern": NEEDLE,
+                "where": native_where,
+                "regex": False,
+                "case_sensitive": True,
+                "whole_word": False,
+                "use_buffer": False,
+            },
+        )
+        self.window.run_command("find_all")
+        yield 100
+        result_view = self.window.find_output_panel("find_results")
+
+        def search_finished():
+            text = result_view.substr(sublime.Region(0, result_view.size())).rstrip()
+            return bool(text) and " match" in text.splitlines()[-1]
+
+        yield search_finished
+        return {path for path, _line, _column in result_view.find_all_results()}
 
     def _open_file(self, path: str):
         view = self.window.open_file(path)

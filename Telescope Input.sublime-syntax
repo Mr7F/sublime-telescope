@@ -9,6 +9,6 @@ contexts:
   main:
     - match: '^(.+?)( {2,})(.*)$'
       captures:
-        1: string.unquoted.directory-glob.telescope
+        1: string.unquoted.path-glob.telescope
         2: punctuation.separator.telescope
         3: text.telescope.search-query

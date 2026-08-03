@@ -13,7 +13,7 @@ import time
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-from itertools import groupby
+from itertools import groupby, islice
 from sublime import View, Window
 from typing import Any
 
@@ -22,6 +22,8 @@ from .utils import _convert_sublime_glob_to_rg_glob, debounced
 
 PANEL_NAME = "telescope"
 PARSER_PANEL_NAME = "telescope-syntax-parser"
+PHANTOM_REFRESH_MS = 50
+MAX_RENDER_LINES = 50_000
 
 StyledToken = "tuple[str, dict[str, Any]]"
 LabelWidths = "tuple[int, int]"
@@ -38,6 +40,11 @@ class SearchResult:
 
 
 @dataclass
+class SearchTask:
+    processes: tuple[subprocess.Popen, ...] = ()
+
+
+@dataclass
 class SearchState:
     directory_glob: str = ""
     current_file: bool = False  # search only in the current file
@@ -46,12 +53,17 @@ class SearchState:
     results: list[SearchResult] = field(default_factory=list)
     is_open: bool = False  # the search panel is open
     phantom_refresh_active: bool = False
+    phantom_render_generation: int = 0
+    phantom_render_thread: threading.Thread | None = None
+    phantom_visible_rows: frozenset[int] = frozenset()
+    reset_render_cache: bool = False
     # The io panel views and input listener, they survive closing the
     # panel: it is only hidden and reused on the next open
     output_view: View | None = None
     input_view: View | None = None
     listener: InputListener | None = None
-    result_phantom_sets: dict[int, sublime.PhantomSet] = field(default_factory=dict)
+    result_phantom_set: sublime.PhantomSet | None = None
+    result_phantoms: dict[int, sublime.Phantom] = field(default_factory=dict)
     result_label_widths: LabelWidths = (0, 0)  # (max path size, max line number size)
 
     # Hidden panel used to parse and style the result lines, and the file it holds
@@ -60,12 +72,13 @@ class SearchState:
     styled_line_cache: dict[tuple[str, int], list[StyledToken]] = field(
         default_factory=dict
     )
+    unstyled_result_paths: set[str] = field(default_factory=set)
 
     preview: View | None = None  # The view opened to preview the highlighted result
     loading_preview: SearchResult | None = (
         None  # Result waiting for the preview file to finish loading
     )
-    processes: tuple[subprocess.Popen, ...] = ()  # Processes of the search in progress
+    search_task: SearchTask | None = None
 
     # State of the window before the search, restored when canceling
     active_view: View | None = None
@@ -148,8 +161,7 @@ class TelescopeCommand(sublime_plugin.WindowCommand):
             # panel, the files may also have changed since the last search
             state.highlight_index = 0
             state.results = []
-            state.styled_line_cache.clear()
-            state.parser_view_path = None
+            state.reset_render_cache = True
             _clear_result_phantoms(state)
             _set_panel_text(state.output_view, "")
             state.output_view.erase_regions("telescope-selected")
@@ -248,13 +260,21 @@ class InputListener(sublime_plugin.TextChangeListener):
 
 class TelescopeEventListener(sublime_plugin.EventListener):
     def on_load(self, view: View):
-        state = search_state[view.window()]
+        window = view.window()
+        state = search_state.get(window) if window else None
+        if not state:
+            return
         if view == state.preview and state.loading_preview:
             _highlight_result_in_preview(view, state.loading_preview, state.text)
             state.loading_preview = None
 
     def on_pre_close_window(self, window: Window):
-        search_state.pop(window, None)
+        state = search_state.get(window)
+        if state:
+            state.is_open = False
+            state.phantom_render_generation += 1
+            _kill_search(window)
+            search_state.pop(window, None)
 
 
 def _search_context(state: SearchState) -> tuple:
@@ -283,29 +303,47 @@ def _search(window: Window, input_text: str):
     if not state.current_file:
         state.directory_glob = directory_glob
     _kill_search(window)
+    task = SearchTask()
+    state.search_task = task
     search_context = _search_context(state)
     # Search in the background, it can lag on big projects
     threading.Thread(
         target=_search_in_background,
-        args=(window, search_query, state.directory_glob, search_context),
+        args=(
+            window,
+            state,
+            task,
+            search_query,
+            state.directory_glob,
+            search_context,
+        ),
         daemon=True,
     ).start()
 
 
 def _search_in_background(
     window: Window,
+    state: SearchState,
+    task: SearchTask,
     search_query: str,
     directory_glob: str,
     search_context: tuple,
 ):
     start = time.time()
-    results = _live_search(window, search_query, directory_glob)
+    results = _live_search(
+        window, search_query, directory_glob, state=state, search_task=task
+    )
 
     def show_results():
-        state = search_state[window]
-        if _search_context(state) != search_context or not state.is_open:
+        if (
+            search_state.get(window) is not state
+            or state.search_task is not task
+            or _search_context(state) != search_context
+            or not state.is_open
+        ):
             # The search changed or was closed in the meantime
             return
+        state.search_task = None
         state.results = results
         state.result_label_widths = _result_label_widths(results)
         state.highlight_index = min(state.highlight_index, max(len(results) - 1, 0))
@@ -336,7 +374,7 @@ def _render_results(window: Window):
             else "No result"
         ),
     )
-    _update_result_phantoms(window)
+    _refresh_result_phantoms(window)
     if results:
         _highlight_result_in_output_panel(window)
     else:
@@ -350,8 +388,13 @@ def _assign_panel_syntax(window: Window):
     _copy_color_scheme(window, output_view)
 
 
-def _copy_color_scheme(window: Window, view: View):
-    source_view = _source_view(window)
+def _copy_color_scheme(
+    window: Window, view: View, state: SearchState | None = None
+):
+    if state:
+        source_view = state.active_view or window.active_view()
+    else:
+        source_view = _source_view(window)
     color_scheme = source_view.settings().get("color_scheme") if source_view else None
     if color_scheme:
         view.settings().set("color_scheme", color_scheme)
@@ -371,17 +414,92 @@ def _set_panel_text(view: View, text: str):
 # Output Panel
 
 
-def _update_result_phantoms(window: Window):
+def _update_result_phantoms(window: Window, visible_rows: frozenset[int]):
     state = search_state[window]
-    if not state.results:
+    if not state.results or state.phantom_render_thread is not None:
         return
 
     # Only render the visible rows, and only once: scrolling reveals the
-    # missing ones through the periodic refresh
-    rows = _visible_result_rows(state) - state.result_phantom_sets.keys()
-    # Group by path so the parser panel loads each file only once
-    for row in sorted(rows, key=lambda row: state.results[row].path):
-        _update_result_phantom(window, row)
+    # missing ones through the periodic refresh. Group rows by path so each
+    # full file is loaded into the parser panel only once per batch.
+    rows = sorted(
+        visible_rows - state.result_phantoms.keys(),
+        key=lambda row: state.results[row].path,
+    )
+    if not rows:
+        return
+
+    results = state.results
+    generation = state.phantom_render_generation
+    worker = threading.Thread(
+        target=_render_result_phantoms,
+        args=(window, state, generation, rows, results),
+        daemon=True,
+    )
+    state.phantom_render_thread = worker
+    worker.start()
+
+
+def _render_result_phantoms(
+    window: Window,
+    state: SearchState,
+    generation: int,
+    rows: list[int],
+    results: list[SearchResult],
+):
+    """Compute visible result styles on this state's single renderer thread."""
+    try:
+        if state.reset_render_cache:
+            state.styled_line_cache.clear()
+            state.unstyled_result_paths.clear()
+            state.parser_view_path = None
+            state.reset_render_cache = False
+        for row in rows:
+            if (
+                not state.is_open
+                or state.phantom_render_generation != generation
+            ):
+                return
+            result = results[row]
+            tokens = _result_tokens(window, state, result) or [
+                (result.line_content, {})
+            ]
+            sublime.set_timeout(
+                lambda row=row, tokens=tokens: _insert_rendered_result(
+                    window, state, generation, results, row, tokens
+                )
+            )
+    finally:
+        worker = threading.current_thread()
+        sublime.set_timeout(
+            lambda: _finish_result_render(window, state, worker)
+        )
+
+
+def _finish_result_render(
+    window: Window, state: SearchState, worker: threading.Thread
+):
+    if state.phantom_render_thread is worker:
+        state.phantom_render_thread = None
+    if search_state.get(window) is state and state.is_open:
+        _refresh_result_phantoms(window)
+
+
+def _insert_rendered_result(
+    window: Window,
+    state: SearchState,
+    generation: int,
+    results: list[SearchResult],
+    row: int,
+    tokens: list[StyledToken],
+):
+    """Insert worker output only if its search is still displayed."""
+    if (
+        search_state.get(window) is state
+        and state.phantom_render_generation == generation
+        and state.results is results
+    ):
+        _insert_result_phantom(window, row, tokens)
 
 
 def _visible_result_rows(state: SearchState) -> set[int]:
@@ -392,33 +510,35 @@ def _visible_result_rows(state: SearchState) -> set[int]:
     return set(range(first_row, last_row + 1)) | {state.highlight_index}
 
 
-def _update_result_phantom(window: Window, row: int):
+def _insert_result_phantom(window: Window, row: int, tokens: list[StyledToken]):
+    """Anchor and show a row's phantom after the panel text was updated."""
     state = search_state[window]
+    if (
+        not state.is_open
+        or row in state.result_phantoms
+        or row >= len(state.results)
+    ):
+        return
     output_view = state.output_view
-    result = state.results[row]
-    tokens = _result_tokens(window, result) or [(result.line_content, {})]
     line_text = "".join(text for text, _ in tokens)
 
-    phantom_set = state.result_phantom_sets.get(row)
-    if not phantom_set:
-        phantom_set = sublime.PhantomSet(output_view, f"telescope-result-{row}")
-        state.result_phantom_sets[row] = phantom_set
+    if state.result_phantom_set is None:
+        state.result_phantom_set = sublime.PhantomSet(
+            output_view, "telescope-results"
+        )
 
     # After the "file:line" label, which is the panel text of the row
     line_end = output_view.line(output_view.text_point(row, 0)).end()
-    phantom_set.update(
-        [
-            sublime.Phantom(
-                sublime.Region(line_end, line_end),
-                _result_html(
-                    _style_view(window),
-                    tokens,
-                    _fuzzy_match_indexes(state.text, line_text),
-                ),
-                sublime.PhantomLayout.INLINE,
-            )
-        ]
+    state.result_phantoms[row] = sublime.Phantom(
+        sublime.Region(line_end, line_end),
+        _result_html(
+            _style_view(window),
+            tokens,
+            _fuzzy_match_indexes(state.text, line_text),
+        ),
+        sublime.PhantomLayout.INLINE,
     )
+    state.result_phantom_set.update(list(state.result_phantoms.values()))
 
 
 def _style_view(window: Window) -> View:
@@ -426,17 +546,29 @@ def _style_view(window: Window) -> View:
     return _source_view(window) or search_state[window].output_view
 
 
-def _result_tokens(window: Window, result: SearchResult) -> list[StyledToken]:
+def _result_tokens(
+    window: Window, state: SearchState, result: SearchResult
+) -> list[StyledToken]:
     """Build the `StyledToken` for the given search, for color highlighting."""
-    state = search_state[window]
     key = (result.path, result.line_number)
     if key not in state.styled_line_cache:
-        if state.current_file:
-            view = _source_view(window)
+        if result.path in state.unstyled_result_paths:
+            view = None
+        elif state.current_file:
+            view = state.active_view or window.active_view()
+            if view and _view_line_count(view) > MAX_RENDER_LINES:
+                state.unstyled_result_paths.add(result.path)
+                view = None
         else:
-            view = _parser_view_for_result(window, result)
+            view = _parser_view_for_result(window, state, result)
         state.styled_line_cache[key] = _tokens_from_view(view, result) if view else []
     return state.styled_line_cache[key]
+
+
+def _view_line_count(view: View) -> int:
+    if not view.size():
+        return 0
+    return view.rowcol(view.size() - 1)[0] + 1
 
 
 def _tokens_from_view(view: View, result: SearchResult) -> list[StyledToken]:
@@ -457,30 +589,35 @@ def _tokens_from_view(view: View, result: SearchResult) -> list[StyledToken]:
     return tokens
 
 
-def _parser_view_for_result(window: Window, result: SearchResult) -> View | None:
+def _parser_view_for_result(
+    window: Window, state: SearchState, result: SearchResult
+) -> View | None:
     """Load the search result in a view for color highlighting."""
-    state = search_state[window]
     parser_view = state.parser_view
+    if parser_view and state.parser_view_path == result.path:
+        return parser_view
+
+    try:
+        with open(result.path, encoding="utf-8", errors="replace") as f:
+            lines = list(islice(f, MAX_RENDER_LINES + 1))
+    except OSError:
+        state.unstyled_result_paths.add(result.path)
+        return None
+    if len(lines) > MAX_RENDER_LINES:
+        state.unstyled_result_paths.add(result.path)
+        return None
+    content = "".join(lines)
+
     if not parser_view:
         parser_view = window.create_output_panel(PARSER_PANEL_NAME, unlisted=True)
         parser_view.settings().set("gutter", False)
         parser_view.settings().set("word_wrap", False)
         state.parser_view = parser_view
-        state.parser_view_path = None
-
-    if state.parser_view_path == result.path:
-        return parser_view
-
-    try:
-        with open(result.path, encoding="utf-8", errors="replace") as f:
-            content = f.read()
-    except OSError:
-        return None
 
     syntax = sublime.find_syntax_for_file(result.path, content.split("\n", 1)[0])
     if syntax:
         parser_view.assign_syntax(syntax)
-    _copy_color_scheme(window, parser_view)
+    _copy_color_scheme(window, parser_view, state)
 
     _set_panel_text(parser_view, content)
     state.parser_view_path = result.path
@@ -488,7 +625,7 @@ def _parser_view_for_result(window: Window, result: SearchResult) -> View | None
 
 
 def _start_phantom_refresh(window: Window):
-    """Color the result rows lazily as they get scrolled or moved into view."""
+    """Color result rows as the viewport moves."""
     state = search_state[window]
     if state.phantom_refresh_active:
         # Reopening reuses the loop of the previous search
@@ -502,16 +639,41 @@ def _start_phantom_refresh(window: Window):
         if not state.is_open:
             state.phantom_refresh_active = False
             return
-        _update_result_phantoms(window)
-        sublime.set_timeout(refresh, 150)
+        _refresh_result_phantoms(window)
+        sublime.set_timeout(refresh, PHANTOM_REFRESH_MS)
 
-    sublime.set_timeout(refresh, 150)
+    sublime.set_timeout(refresh, PHANTOM_REFRESH_MS)
+
+
+def _refresh_result_phantoms(window: Window):
+    state = search_state[window]
+    visible_rows = (
+        frozenset(_visible_result_rows(state)) if state.results else frozenset()
+    )
+    if visible_rows != state.phantom_visible_rows:
+        state.phantom_visible_rows = visible_rows
+        state.phantom_render_generation += 1
+        _remove_hidden_result_phantoms(state, visible_rows)
+    _update_result_phantoms(window, visible_rows)
+
+
+def _remove_hidden_result_phantoms(
+    state: SearchState, visible_rows: frozenset[int]
+):
+    hidden_rows = state.result_phantoms.keys() - visible_rows
+    if not hidden_rows:
+        return
+    for row in hidden_rows:
+        state.result_phantoms.pop(row)
+    state.result_phantom_set.update(list(state.result_phantoms.values()))
 
 
 def _clear_result_phantoms(state: SearchState):
-    for phantom_set in state.result_phantom_sets.values():
-        phantom_set.update([])
-    state.result_phantom_sets.clear()
+    state.phantom_render_generation += 1
+    state.phantom_visible_rows = frozenset()
+    state.result_phantoms.clear()
+    if state.result_phantom_set:
+        state.result_phantom_set.update([])
 
 
 def _result_html(
@@ -889,7 +1051,7 @@ def _get_sidebar_folders(window: Window) -> list[str]:
                     roots=[path],
                 )
             for glob in include_globs or [f"{path}/**"]:
-                args += ("--iglob", glob)
+                args += ("--glob", glob)
 
     # The excludes come last: for rg the last matching glob wins, they
     # apply within the included entries
@@ -904,17 +1066,17 @@ def _get_sidebar_folders(window: Window) -> list[str]:
                 directory=True,
                 roots=roots,
             ):
-                args += ("--iglob", f"!{glob}")
+                args += ("--glob", f"!{glob}")
         file_patterns = source.get("file_exclude_patterns") or []
         file_patterns += source.get("binary_file_patterns") or []
         for pattern in file_patterns:
             for glob in _convert_sublime_glob_to_rg_glob(pattern, roots=roots):
-                args += ("--iglob", f"!{glob}")
+                args += ("--glob", f"!{glob}")
 
     return args + folders
 
 
-def _directory_glob_patterns(directory_glob: str) -> list[str]:
+def _path_glob_patterns(directory_glob: str) -> list[str]:
     return [
         pattern.strip()
         for pattern in directory_glob.split(",")
@@ -926,7 +1088,13 @@ def _live_search(
     window: Window,
     search_query: str,
     directory_glob: str = "",
+    *,
+    state: SearchState | None = None,
+    search_task: SearchTask | None = None,
 ) -> list[SearchResult]:
+    state = state or search_state[window]
+    if search_task is not None and state.search_task is not search_task:
+        return []
     settings = _settings()
     if len(search_query) < settings.get("min_query_length", 3):
         return []
@@ -941,6 +1109,7 @@ def _live_search(
         "--max-count",
         "10000",
         "--follow",
+        "--hidden",
         "--with-filename",
         "--line-number",
         "--smart-case",
@@ -949,8 +1118,7 @@ def _live_search(
         ".*".join(map(re.escape, search_query)),
     ]
 
-    state = search_state[window]
-    view = _source_view(window)
+    view = state.active_view or window.active_view()
 
     folders = []
     if state.current_file:
@@ -963,25 +1131,47 @@ def _live_search(
             # Without folders rg would search its working directory
             return []
 
-        for glob in _directory_glob_patterns(directory_glob):
+        path_globs = _path_glob_patterns(directory_glob)
+        # Sublime applies every exclusion after the union of all includes,
+        # independent of their order in the Where field.
+        path_globs.sort(key=lambda glob: glob.startswith("-"))
+        for glob in path_globs:
+            exclude = glob.startswith("-")
+            if exclude:
+                glob = glob[1:].strip()
+            if not glob:
+                continue
             # `--type` exists, but it works only for a fixed list of types.
-            # Keep the same glob behavior as Sublime project folder filters.
-            for rg_glob in _convert_sublime_glob_to_rg_glob(
-                glob,
-                directory=True,
-                roots=window.folders(),
-            ):
-                rg_cmd.extend(("--iglob", rg_glob))
+            # Sublime's Where field matches both files and directories.
+            rg_globs = _convert_sublime_glob_to_rg_glob(
+                glob, roots=window.folders()
+            )
+            normalized_glob = glob.replace("\\", "/")
+            last_component = normalized_glob.rstrip("/").rsplit("/", 1)[-1]
+            if normalized_glob.endswith("/") or "." not in last_component:
+                rg_globs += _convert_sublime_glob_to_rg_glob(
+                    glob, directory=True, roots=window.folders()
+                )
+            for rg_glob in dict.fromkeys(rg_globs):
+                rg_cmd.extend(("--glob", f"!{rg_glob}" if exclude else rg_glob))
 
         # Newlines in paths split fzf's line-delimited records. Keep this
-        # exclude after directory globs so it cannot be overridden.
-        rg_cmd.extend(("--iglob", "!*\n*"))
+        # exclude after path globs so it cannot be overridden.
+        rg_cmd.extend(("--glob", "!*\n*"))
         rg_cmd += folders
 
     if settings.get("debug"):
         print(" ".join(rg_cmd))
 
     rg_process = _create_process(rg_cmd)
+    if search_task is not None:
+        search_task.processes = (rg_process,)
+    if search_task is not None and state.search_task is not search_task:
+        rg_process.stdout.close()
+        _kill_processes((rg_process,))
+        search_task.processes = ()
+        return []
+
     fzf_cmd = [
         "fzf",
         "--filter",
@@ -991,45 +1181,76 @@ def _live_search(
         "--nth",  # only do fuzzy match on the third column (the file content)
         "3..",
     ]
-    fzf_process = _create_process(
-        fzf_cmd,
-        stdin=rg_process.stdout,
-        decode_stdout=True,
-    )
-    rg_process.stdout.close()
-    state.processes = (rg_process, fzf_process)
-    results = []
-    for _ in range(settings.get("max_results", 5000)):
-        line = fzf_process.stdout.readline().rstrip("\n")
-        if not line:
-            break
-
-        parsed = _parse_rg_result(line)
-        if not parsed:
-            continue
-
-        path, line_number, content = parsed
-        match_indexes = _fuzzy_match_indexes(search_query, content)
-        results.append(
-            SearchResult(
-                path,
-                line_number,
-                 # fzf scores the full rg output, including the path, but rg already
-                  # guaranteed that the content fuzzy-matches the query.
-                min(match_indexes, default=len(content) - len(content.lstrip())),
-                content[:200],
-            )
+    try:
+        fzf_process = _create_process(
+            fzf_cmd,
+            stdin=rg_process.stdout,
+            decode_stdout=True,
         )
+    except Exception:
+        rg_process.stdout.close()
+        _kill_processes((rg_process,))
+        if search_task is not None:
+            search_task.processes = ()
+        raise
+    rg_process.stdout.close()
+    processes = (rg_process, fzf_process)
+    if search_task is not None:
+        search_task.processes = processes
+    if search_task is not None and state.search_task is not search_task:
+        _kill_processes(processes)
+        search_task.processes = ()
+        return []
 
-    rg_process.terminate()
-    fzf_process.terminate()
+    try:
+        results = []
+        for _ in range(settings.get("max_results", 5000)):
+            line = fzf_process.stdout.readline().rstrip("\n")
+            if not line:
+                break
 
-    return results
+            parsed = _parse_rg_result(line)
+            if not parsed:
+                continue
+
+            path, line_number, content = parsed
+            match_indexes = _fuzzy_match_indexes(search_query, content)
+            results.append(
+                SearchResult(
+                    path,
+                    line_number,
+                    min(
+                        match_indexes,
+                        default=len(content) - len(content.lstrip()),
+                    ),
+                    content[:200],
+                )
+            )
+        return results
+    finally:
+        _kill_processes(processes)
+        if search_task is not None and search_task.processes is processes:
+            search_task.processes = ()
 
 
 def _kill_search(window: Window):
-    for process in search_state[window].processes:
-        process.terminate()
+    state = search_state.get(window)
+    if not state:
+        return
+    task = state.search_task
+    state.search_task = None
+    if task:
+        _kill_processes(task.processes)
+        task.processes = ()
+
+
+def _kill_processes(processes: tuple[subprocess.Popen, ...]):
+    for process in processes:
+        try:
+            if process.poll() is None:
+                process.kill()
+        except ProcessLookupError:
+            pass
 
 
 def _settings() -> sublime.Settings:

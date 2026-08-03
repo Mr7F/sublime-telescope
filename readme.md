@@ -14,12 +14,14 @@ Ripgrep and fzf are configured in **"smart case"** mode (case insensitive if eve
 
 The results are shown in an output panel; use the up/down arrows to navigate them (the highlighted result is previewed), enter to open it and escape to cancel and go back where you was.
 
-To reduce the search space in project mode, put a directory glob, two spaces, then the search query:
+To reduce the search space in project mode, put a file or directory glob, two spaces, then the search query:
+- `*.py  search_term`: search for `search_term` in Python files
+- `*.py,-test_*.py  search_term`: exclude matching test files
 - `models  search_user`: search for `search_user` in directories matching `models`
 - `enterprise/*/models  search_user`: search in matching model directories
 - `models,views  kanban`: search in directories matching either `models` or `views`
 
-Without two spaces, the whole input is used as the search query. Current-file mode ignores the directory glob in the input; when switching back to project mode, the previous directory glob is shown again.
+Without two spaces, the whole input is used as the search query. Current-file mode ignores the path glob in the input; when switching back to project mode, the previous path glob is shown again.
 
 In addition to the default `ripgrep` behavior (ignoring file specified in `.gitignore`, etc), it will ignore files matching
 - `binary_file_patterns`

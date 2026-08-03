@@ -3,6 +3,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 
 import sublime
 from unittesting import DeferrableTestCase
@@ -113,6 +114,27 @@ class TestTelescope(DeferrableTestCase):
         self.assertEqual(self.window.active_view().file_name(), target)
         self.assertIsNone(self._view_for_file(ignored))
 
+    def test_project_search_path_glob_matches_file_names(self):
+        seed = _write(
+            os.path.join(self.project_dir, "seed.txt"),
+            "open before searching\n",
+        )
+        target = _write(
+            os.path.join(self.project_dir, "target.py"),
+            "file_glob_unique_target\n",
+        )
+        _write(
+            os.path.join(self.project_dir, "ignored.xml"),
+            "file_glob_unique_target\n",
+        )
+        yield from self._open_file(seed)
+
+        self.window.run_command("telescope")
+        yield from self._replace_search_input("*.py  file_glob_unique_target")
+        yield from self._wait_for_preview(target)
+
+        self.assertEqual(self._panel_text(), "target.py:1")
+
     def test_project_search_fuzzy_scores_content_not_path(self):
         """Check that the path is not used for fuzzy scoring."""
         seed = _write(
@@ -143,6 +165,80 @@ class TestTelescope(DeferrableTestCase):
         self.assertEqual(self._highlighted_row(), 0)
         self.assertIsNotNone(self._view_for_file(better_content))
         self.assertIsNone(self._view_for_file(better_path))
+
+    def test_completed_search_clears_task(self):
+        seed = _write(
+            os.path.join(self.project_dir, "completed.py"),
+            "completed_search_task_needle\n",
+        )
+        yield from self._open_file(seed)
+
+        self.window.run_command("telescope")
+        yield from self._replace_search_input("completed_search_task_needle")
+
+        state = self._telescope_module().search_state[self.window]
+        yield lambda: state.search_task is None
+        self.assertEqual(len(state.results), 1)
+
+    def test_rapid_search_replacement_discards_the_old_task(self):
+        seed = _write(
+            os.path.join(self.project_dir, "replacement.py"),
+            "obsolete_search_needle\nreplacement_search_needle\n",
+        )
+        yield from self._open_file(seed)
+
+        self.window.run_command("telescope")
+        yield from self._wait_for_search_input()
+        telescope = self._telescope_module()
+        state = telescope.search_state[self.window]
+
+        telescope._search(self.window, "obsolete_search_needle")
+        obsolete_task = state.search_task
+        self.assertIsNotNone(obsolete_task)
+        telescope._search(self.window, "replacement_search_needle")
+
+        yield lambda: state.search_task is None
+        self.assertEqual(obsolete_task.processes, ())
+        self.assertTrue(state.results)
+        self.assertTrue(
+            all(
+                "replacement_search_needle" in result.line_content
+                for result in state.results
+            )
+        )
+
+    def test_cancel_kills_active_search_process(self):
+        seed = _write(
+            os.path.join(self.project_dir, "cancel_process.py"),
+            "cancel process seed\n",
+        )
+        yield from self._open_file(seed)
+
+        self.window.run_command("telescope")
+        yield from self._wait_for_search_input()
+        telescope = self._telescope_module()
+        process = telescope._create_process(
+            ["fzf", "--filter", "blocked_search"],
+            stdin=subprocess.PIPE,
+            decode_stdout=True,
+        )
+        task = telescope.SearchTask((process,))
+        state = telescope.search_state[self.window]
+        state.search_task = task
+
+        try:
+            self.assertIsNone(process.poll())
+            self.window.run_command("telescope_cancel")
+            yield lambda: process.poll() is not None
+
+            self.assertIsNone(state.search_task)
+            self.assertEqual(task.processes, ())
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            process.stdin.close()
+            process.stdout.close()
 
     def test_project_search_excludes_newline_paths_even_when_directory_glob_matches(self):
         r"""Check that file with \n in their name are ignored.
@@ -219,6 +315,34 @@ class TestTelescope(DeferrableTestCase):
 
         self.assertEqual(self._panel_text(), "match.py:1")
 
+    def test_folder_exclude_pattern_can_include_sidebar_root_name(self):
+        root = os.path.join(self.project_dir, "workspace")
+        target = _write(
+            os.path.join(root, "kept", "match.py"),
+            "root_name_exclude_needle\n",
+        )
+        _write(
+            os.path.join(root, "writable", "match.py"),
+            "root_name_exclude_needle\n",
+        )
+        self.window.set_project_data(
+            {
+                "folders": [
+                    {
+                        "path": root,
+                        "folder_exclude_patterns": ["workspace/writable"],
+                    },
+                ],
+            }
+        )
+        yield from self._open_file(target)
+
+        self.window.run_command("telescope")
+        yield from self._replace_search_input("root_name_exclude_needle")
+        yield from self._wait_for_preview(target)
+
+        self.assertEqual(self._panel_text(), "match.py:1")
+
     def test_project_folder_include_patterns_limit_results(self):
         seed = _write(
             os.path.join(self.project_dir, "social_seed", "seed.py"),
@@ -251,6 +375,140 @@ class TestTelescope(DeferrableTestCase):
         yield from self._wait_for_preview(target)
 
         self.assertEqual(self._panel_text(), "match.py:1")
+
+    def test_result_phantom_is_anchored_after_the_full_label(self):
+        """The color phantom must appear after the whole "file:line" label,
+        not truncate it (e.g. land between the filename and the line
+        number). Computing where to anchor it needs the output view's
+        current line layout, which is why `_insert_result_phantom` runs on
+        the main thread after the result panel has been updated.
+        """
+        seed = _write(
+            os.path.join(self.project_dir, "seed.py"),
+            "open before searching\n",
+        )
+        for i in range(8):
+            _write(
+                os.path.join(self.project_dir, f"phantom_anchor_{i}.py"),
+                f"def foo_{i}():\n    return phantom_anchor_needle\n",
+            )
+        yield from self._open_file(seed)
+
+        telescope = self._telescope_module()
+        original_insert = telescope._insert_result_phantom
+        checked = []
+
+        def spy(window, row, tokens):
+            original_phantom = sublime.Phantom
+            captured = {}
+
+            class CapturingPhantom(original_phantom):
+                def __init__(self, region, *args, **kwargs):
+                    captured["begin"] = region.begin()
+                    super().__init__(region, *args, **kwargs)
+
+            sublime.Phantom = CapturingPhantom
+            try:
+                original_insert(window, row, tokens)
+            finally:
+                sublime.Phantom = original_phantom
+
+            if "begin" in captured:
+                state = telescope.search_state[window]
+                expected_label = telescope._result_location_label(
+                    state.results[row], state.result_label_widths
+                )
+                row_start = state.output_view.text_point(row, 0)
+                checked.append((captured["begin"], row_start + len(expected_label)))
+
+        telescope._insert_result_phantom = spy
+        try:
+            self.window.run_command("telescope")
+            yield from self._replace_search_input("phantom_anchor_needle")
+            yield lambda: len(checked) >= 5
+            yield 300  # let the periodic refresh color a few more rows
+        finally:
+            telescope._insert_result_phantom = original_insert
+
+        self.assertTrue(checked)
+        for anchor, expected_anchor in checked:
+            self.assertEqual(anchor, expected_anchor)
+
+    def test_result_styles_render_off_main_thread(self):
+        seed = _write(
+            os.path.join(self.project_dir, "seed.py"),
+            "open before searching\n",
+        )
+        _write(
+            os.path.join(self.project_dir, "slow_render.py"),
+            "".join(f"slow_render_needle {line}\n" for line in range(100)),
+        )
+        yield from self._open_file(seed)
+
+        telescope = self._telescope_module()
+        original_result_tokens = telescope._result_tokens
+        main_thread = threading.current_thread()
+        render_threads = []
+        render_started = threading.Event()
+        release_render = threading.Event()
+
+        def slow_result_tokens(window, state, result):
+            render_threads.append(threading.current_thread())
+            render_started.set()
+            release_render.wait(10)
+            return [(result.line_content, {})]
+
+        telescope._result_tokens = slow_result_tokens
+        try:
+            self.window.run_command("telescope")
+            yield from self._replace_search_input("slow_render_needle")
+            yield render_started.is_set
+
+            main_thread_ran = threading.Event()
+            sublime.set_timeout(main_thread_ran.set)
+            yield main_thread_ran.is_set
+
+            state = telescope.search_state[self.window]
+            generation = state.phantom_render_generation
+            self.assertIsNotNone(state.phantom_render_thread)
+            state.output_view.set_viewport_position(
+                (0, state.output_view.layout_extent()[1]), animate=False
+            )
+            yield lambda: state.phantom_render_generation > generation
+        finally:
+            release_render.set()
+            telescope._result_tokens = original_result_tokens
+            state = telescope.search_state[self.window]
+            yield lambda: state.phantom_render_thread is None
+
+        self.assertTrue(render_threads)
+        self.assertTrue(all(thread is not main_thread for thread in render_threads))
+
+    def test_files_over_render_line_cap_use_raw_result_text(self):
+        telescope = self._telescope_module()
+        at_limit = _write(
+            os.path.join(self.project_dir, "at_render_limit.py"),
+            "render line\n" * telescope.MAX_RENDER_LINES,
+        )
+        over_limit = _write(
+            os.path.join(self.project_dir, "over_render_limit.py"),
+            "render line\n" * (telescope.MAX_RENDER_LINES + 1),
+        )
+        state = telescope.search_state[self.window]
+
+        self.assertIsNotNone(
+            telescope._parser_view_for_result(
+                self.window,
+                state,
+                telescope.SearchResult(at_limit, 1, 0, "render line"),
+            )
+        )
+        result = telescope.SearchResult(over_limit, 1, 0, "render line")
+        self.assertEqual(telescope._result_tokens(self.window, state, result), [])
+        self.assertIn(over_limit, state.unstyled_result_paths)
+
+        os.unlink(over_limit)
+        self.assertEqual(telescope._result_tokens(self.window, state, result), [])
 
     def test_current_file_search_opens_only_the_active_file(self):
         current = _write(

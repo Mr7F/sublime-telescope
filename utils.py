@@ -87,10 +87,26 @@ def _convert_sublime_glob_to_rg_glob(
             if directory_pattern:
                 glob = f"{glob}/**"
             globs.append(glob)
+
+    # A pattern may include the sidebar root's name itself.
+    if roots and path_pattern and not (absolute or project_relative or root_relative):
+        for root in roots:
+            root_name = root.rsplit("/", 1)[-1] + "/"
+            if not pattern.startswith(root_name):
+                continue
+            remainder = pattern[len(root_name) :]
+            for body in _sublime_pattern_body_rg_globs(remainder, "/" in remainder):
+                glob = f"{root}/{body}"
+                if directory_pattern:
+                    glob = f"{glob}/**"
+                globs.append(glob)
     return _dedupe(globs)
 
 
 def _sublime_pattern_body_rg_globs(pattern: str, path_pattern: bool) -> list[str]:
+    # Sublime treats a bare `*.*` as matching all files, including files with no dot.
+    if pattern == "*.*":
+        pattern = "*"
     pattern = _escape_rg_glob(pattern)
     if not path_pattern:
         return [pattern]
